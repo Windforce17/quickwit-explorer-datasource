@@ -1,0 +1,53 @@
+{
+  "name": "quickwit-explorer-datasource",
+  "version": "1.0.0",
+  "description": "Quickwit data source plugin for Grafana with index discovery, trace view, and log-trace correlation",
+  "scripts": {
+    "build": "webpack -c ./webpack.config.ts --env production",
+    "dev": "webpack -w -c ./webpack.config.ts --env development",
+    "test": "jest --passWithNoTests",
+    "lint": "eslint --fix src/",
+    "typecheck": "tsc --noEmit",
+    "server": "docker compose up --build"
+  },
+  "author": "Quickwit Explorer",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@grafana/eslint-config": "^7.0.0",
+    "@swc/core": "^1.7.0",
+    "@swc/jest": "^0.2.37",
+    "@testing-library/jest-dom": "^6.5.0",
+    "@testing-library/react": "^16.0.0",
+    "@types/jest": "^29.5.12",
+    "@types/lodash": "^4.17.7",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "copy-webpack-plugin": "^12.0.0",
+    "css-loader": "^7.1.0",
+    "eslint": "^8.57.0",
+    "fork-ts-checker-webpack-plugin": "^9.0.0",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
+    "replace-in-file-webpack-plugin": "^1.0.6",
+    "style-loader": "^4.0.0",
+    "swc-loader": "^0.2.6",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.5.0",
+    "webpack": "^5.93.0",
+    "webpack-cli": "^5.1.0"
+  },
+  "dependencies": {
+    "@emotion/css": "^11.13.0",
+    "@grafana/data": "^11.0.0",
+    "@grafana/runtime": "^11.0.0",
+    "@grafana/ui": "^11.0.0",
+    "lodash": "^4.17.21",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "tslib": "^2.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

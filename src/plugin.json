@@ -1,0 +1,45 @@
+{
+  "type": "datasource",
+  "name": "Quickwit Explorer",
+  "id": "quickwit-explorer-datasource",
+  "metrics": true,
+  "backend": false,
+  "alerting": false,
+  "info": {
+    "description": "Quickwit data source with index discovery, trace view, and log-trace correlation for Grafana",
+    "author": {
+      "name": "Quickwit Explorer"
+    },
+    "keywords": ["quickwit", "traces", "logs", "search", "observability", "jaeger"],
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "version": "%VERSION%",
+    "updated": "%TODAY%"
+  },
+  "dependencies": {
+    "grafanaDependency": ">=11.0.0",
+    "plugins": []
+  },
+  "category": "logging",
+  "logs": true,
+  "tracing": true,
+  "queryOptions": {
+    "maxDataPoints": true,
+    "cacheTimeout": true
+  },
+  "routes": [
+    {
+      "path": "qw",
+      "url": "{{ .JsonData.quickwitUrl }}",
+      "method": "*",
+      "headers": [
+        {
+          "name": "Content-Type",
+          "content": "application/json"
+        }
+      ]
+    }
+  ]
+}
