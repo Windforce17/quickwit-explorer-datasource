@@ -1,6 +1,6 @@
 {
   "name": "quickwit-explorer-datasource",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Quickwit data source plugin for Grafana with index discovery, trace view, and log-trace correlation",
   "scripts": {
     "build": "webpack -c ./webpack.config.ts --env production",
