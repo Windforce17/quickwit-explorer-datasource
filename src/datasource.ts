@@ -416,9 +416,41 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     }
     if (!idx) return [];
 
-    const fields = flattenFieldMappings(idx.index_config.doc_mapping.field_mappings);
-    this.fieldCache.set(indexId, { data: fields, ts: now });
-    return fields;
+    const schemaFields = flattenFieldMappings(idx.index_config.doc_mapping.field_mappings);
+
+    // For json/object fields without explicit sub-fields, try to discover
+    // dynamic sub-fields by sampling one document from the index.
+    const jsonFields = (idx.index_config.doc_mapping.field_mappings || [])
+      .filter((m) => (m.type === 'json' || m.type === 'object') && (!m.field_mappings || m.field_mappings.length === 0));
+
+    if (jsonFields.length > 0) {
+      try {
+        const sampleResp = await this.post<QwSearchResponse>(`/api/v1/${indexId}/search`, {
+          query: '*',
+          max_hits: 1,
+        });
+        if (sampleResp?.hits?.length) {
+          const hit = sampleResp.hits[0];
+          for (const jf of jsonFields) {
+            const nested = hit[jf.name];
+            if (nested && typeof nested === 'object') {
+              const subFields = flattenObject(nested, jf.name);
+              for (const subKey of Object.keys(subFields)) {
+                if (!schemaFields.includes(subKey)) {
+                  schemaFields.push(subKey);
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // Sampling failed, continue with schema-only fields
+      }
+    }
+
+    schemaFields.sort();
+    this.fieldCache.set(indexId, { data: schemaFields, ts: now });
+    return schemaFields;
   }
 
   /**

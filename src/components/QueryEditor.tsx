@@ -517,7 +517,7 @@ export function QueryEditor(props: Props) {
           {/* Group By field for Count - allows counting by a specific field */}
           {q.metricType === MetricAggType.Count && (
             <InlineFieldRow>
-              <InlineField label="Group By" labelWidth={8} tooltip="Optional: group count by a field (uses terms aggregation)">
+              <InlineField label="Group By" labelWidth={10} tooltip="Optional: group count by a field (uses terms aggregation)">
                 <Select
                   width={25}
                   options={[{ label: '-- None (time histogram) --', value: '' }, ...fieldOptions]}
