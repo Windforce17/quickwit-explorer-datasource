@@ -626,6 +626,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       const frame = new MutableDataFrame({
         refId: query.refId,
         meta: {
+          type: 'log-lines' as any,
           preferredVisualisationType: 'logs',
           custom: {
             // Hint for Grafana: only show these labels inline on log lines
