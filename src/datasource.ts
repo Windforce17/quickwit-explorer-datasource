@@ -5,8 +5,11 @@ import {
   DataSourceInstanceSettings,
   FieldType,
   MutableDataFrame,
+  SupplementaryQueryType,
+  LogsVolumeType,
 } from '@grafana/data';
 import { getBackendSrv, getTemplateSrv } from '@grafana/runtime';
+import { cloneDeep } from 'lodash';
 import {
   QuickwitQuery,
   QuickwitOptions,
@@ -23,9 +26,10 @@ import {
 /** Default timeout for trace lookups (ms) */
 const TRACE_TIMEOUT_MS = 5000;
 
-/**
- * Compute a reasonable histogram interval string based on the time range.
- */
+// ================================================================
+//  UTILITY FUNCTIONS
+// ================================================================
+
 function computeAutoInterval(fromMs: number, toMs: number): string {
   const rangeSec = (toMs - fromMs) / 1000;
   if (rangeSec <= 300) return '5s';
@@ -38,41 +42,28 @@ function computeAutoInterval(fromMs: number, toMs: number): string {
   return '1d';
 }
 
-/**
- * Detect the timestamp field name from index metadata.
- * Falls back through common field names.
- */
 function detectTimestampField(indexes: QwIndex[], indexId: string): string {
-  // Try exact match first
   let idx = indexes.find((i) => i.index_config.index_id === indexId);
-
-  // Try wildcard pattern match (e.g. "otel-logs-v0_*" matches "otel-logs-v0_7")
   if (!idx && indexId.includes('*')) {
     const prefix = indexId.replace(/\*/g, '');
     idx = indexes.find((i) => i.index_config.index_id.startsWith(prefix));
   }
-
   if (idx?.index_config?.doc_mapping?.timestamp_field) {
     return idx.index_config.doc_mapping.timestamp_field;
   }
-
-  // Fallback: look for common timestamp field names in field mappings
   if (idx) {
     const allFields = flattenFieldMappings(idx.index_config.doc_mapping.field_mappings);
     const commonTsNames = ['timestamp', '_timestamp', '@timestamp', 'timestamp_nanos'];
     for (const name of commonTsNames) {
-      if (allFields.includes(name)) {
-        return name;
-      }
+      if (allFields.includes(name)) return name;
     }
   }
-
   return 'timestamp';
 }
 
 /**
- * Flatten field mappings recursively, handling both nested field_mappings
- * and object-type fields (type: "object").
+ * Recursively flatten field mappings, handling nested field_mappings
+ * and object-type fields. Produces dot-notation paths like "httpRequest.clientIp".
  */
 function flattenFieldMappings(mappings: QwFieldMapping[], prefix = ''): string[] {
   const fields: string[] = [];
@@ -81,13 +72,15 @@ function flattenFieldMappings(mappings: QwFieldMapping[], prefix = ''): string[]
   for (const m of mappings) {
     const fullName = prefix ? `${prefix}.${m.name}` : m.name;
 
-    // If this field has sub-fields (nested object or explicit field_mappings)
     if (m.field_mappings && m.field_mappings.length > 0) {
-      // Also add the parent as a field (some queries use the parent path)
+      // Recurse into sub-fields
+      fields.push(...flattenFieldMappings(m.field_mappings, fullName));
+    } else if (m.type === 'object') {
+      // Object type without explicit sub-fields - add as-is
       fields.push(fullName);
-      fields.push(...flattenFieldMappings(m.field_mappings, fullName));
-    } else if (m.type === 'object' && m.field_mappings) {
-      fields.push(...flattenFieldMappings(m.field_mappings, fullName));
+    } else if (m.type === 'json') {
+      // JSON type - add as-is, user may query sub-paths
+      fields.push(fullName);
     } else {
       fields.push(fullName);
     }
@@ -96,19 +89,19 @@ function flattenFieldMappings(mappings: QwFieldMapping[], prefix = ''): string[]
 }
 
 /**
- * Flatten a JSON object into dot-notation key-value pairs for log labels.
+ * Flatten a JSON object into dot-notation key-value pairs.
  * e.g. { httpRequest: { clientIp: "1.2.3.4" } } => { "httpRequest.clientIp": "1.2.3.4" }
  */
-function flattenObject(obj: any, prefix = ''): Record<string, string> {
+function flattenObject(obj: any, prefix = '', maxDepth = 10): Record<string, string> {
   const result: Record<string, string> = {};
-  if (!obj || typeof obj !== 'object') return result;
+  if (!obj || typeof obj !== 'object' || maxDepth <= 0) return result;
 
   for (const key of Object.keys(obj)) {
     const fullKey = prefix ? `${prefix}.${key}` : key;
     const val = obj[key];
 
     if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
-      Object.assign(result, flattenObject(val, fullKey));
+      Object.assign(result, flattenObject(val, fullKey, maxDepth - 1));
     } else if (Array.isArray(val)) {
       result[fullKey] = JSON.stringify(val);
     } else if (val !== undefined && val !== null) {
@@ -116,30 +109,6 @@ function flattenObject(obj: any, prefix = ''): Record<string, string> {
     }
   }
   return result;
-}
-
-function extractTimestamp(hit: any): number {
-  const tsFields = [
-    'timestamp', '_timestamp', 'timestamp_nanos', '@timestamp',
-    'span_start_timestamp_nanos',
-  ];
-  for (const field of tsFields) {
-    const val = getNestedValue(hit, field);
-    if (val !== undefined && val !== null) {
-      const num = Number(val);
-      if (!isNaN(num)) {
-        if (num > 1e18) return Math.floor(num / 1e6);
-        if (num > 1e15) return Math.floor(num / 1e3);
-        if (num > 1e12) return num;
-        return num * 1000;
-      }
-      const d = new Date(val);
-      if (!isNaN(d.getTime())) {
-        return d.getTime();
-      }
-    }
-  }
-  return Date.now();
 }
 
 function getNestedValue(obj: any, path: string): any {
@@ -153,20 +122,50 @@ function getNestedValue(obj: any, path: string): any {
   return current;
 }
 
-/**
- * Convert a bucket key to milliseconds, handling various formats Quickwit may return.
- */
+function extractTimestamp(hit: any, tsFieldName?: string): number {
+  // Try the known timestamp field first
+  const fieldsToTry = tsFieldName
+    ? [tsFieldName, 'timestamp', '_timestamp', '@timestamp', 'timestamp_nanos']
+    : ['timestamp', '_timestamp', '@timestamp', 'timestamp_nanos'];
+
+  for (const field of fieldsToTry) {
+    const val = getNestedValue(hit, field);
+    if (val !== undefined && val !== null) {
+      const num = Number(val);
+      if (!isNaN(num)) {
+        if (num > 1e18) return Math.floor(num / 1e6); // nanoseconds
+        if (num > 1e15) return Math.floor(num / 1e3); // microseconds
+        if (num > 1e12) return num;                     // milliseconds
+        return num * 1000;                               // seconds
+      }
+      const d = new Date(val);
+      if (!isNaN(d.getTime())) return d.getTime();
+    }
+  }
+  return Date.now();
+}
+
 function bucketKeyToMs(key: number): number {
-  // Microseconds (> year 2100 in ms)
-  if (key > 4102444800000) {
-    return key / 1000;
-  }
-  // Seconds (< year 2100 in seconds)
-  if (key < 4102444800) {
-    return key * 1000;
-  }
-  // Already milliseconds
-  return key;
+  if (key > 4102444800000) return key / 1000;  // microseconds
+  if (key < 4102444800) return key * 1000;       // seconds
+  return key;                                     // milliseconds
+}
+
+/**
+ * Parse a Lucene query string into individual filter clauses.
+ */
+function parseFilters(query: string): string[] {
+  if (!query || query.trim() === '*' || query.trim() === '') return [];
+  // Split on AND (case-insensitive), preserving quoted strings
+  return query.split(/\s+AND\s+/i).map((f) => f.trim()).filter((f) => f && f !== '*');
+}
+
+/**
+ * Build a Lucene query from filter clauses.
+ */
+function buildQuery(filters: string[]): string {
+  if (filters.length === 0) return '*';
+  return filters.join(' AND ');
 }
 
 // ================================================================
@@ -186,6 +185,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   private readonly INDEX_CACHE_TTL = 30000;
   private fieldCache: Map<string, { data: string[]; ts: number }> = new Map();
   private readonly FIELD_CACHE_TTL = 60000;
+  private tsFieldCache: Map<string, string> = new Map();
 
   constructor(instanceSettings: DataSourceInstanceSettings<QuickwitOptions>) {
     super(instanceSettings);
@@ -199,6 +199,133 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   }
 
   // ================================================================
+  //  DataSourceWithSupplementaryQueriesSupport (duck-typed)
+  //  This enables full-range log volume histograms in Explore.
+  // ================================================================
+
+  getSupportedSupplementaryQueryTypes(): SupplementaryQueryType[] {
+    return [SupplementaryQueryType.LogsVolume];
+  }
+
+  getSupplementaryQuery(
+    options: { type: SupplementaryQueryType },
+    originalQuery: QuickwitQuery
+  ): QuickwitQuery | undefined {
+    if (options.type !== SupplementaryQueryType.LogsVolume) return undefined;
+    if (originalQuery.queryType && originalQuery.queryType !== QueryType.Logs) return undefined;
+
+    return {
+      ...originalQuery,
+      refId: `log-volume-${originalQuery.refId}`,
+      queryType: QueryType.Logs,
+      _isLogsVolume: true,
+    };
+  }
+
+  getSupplementaryRequest(
+    type: SupplementaryQueryType,
+    request: DataQueryRequest<QuickwitQuery>
+  ): DataQueryRequest<QuickwitQuery> | undefined {
+    if (type !== SupplementaryQueryType.LogsVolume) return undefined;
+
+    const logsVolumeRequest = cloneDeep(request);
+    const targets = logsVolumeRequest.targets
+      .map((query) => this.getSupplementaryQuery({ type }, query))
+      .filter((query): query is QuickwitQuery => !!query);
+
+    if (!targets.length) return undefined;
+    return { ...logsVolumeRequest, targets };
+  }
+
+  // ================================================================
+  //  DataSourceWithToggleableQueryFiltersSupport (duck-typed)
+  //  This enables +/- filter buttons on log field values in Explore.
+  // ================================================================
+
+  toggleQueryFilter(
+    query: QuickwitQuery,
+    filter: { key: string; value: string; operator?: string }
+  ): QuickwitQuery {
+    const currentQuery = query.query || '*';
+    const filters = parseFilters(currentQuery);
+    const isExclude = filter.operator === '!=';
+    const newFilter = isExclude ? `NOT ${filter.key}:${filter.value}` : `${filter.key}:${filter.value}`;
+
+    // Check if this exact filter already exists
+    const existingIdx = filters.findIndex((f) => {
+      return f === newFilter || f === `${filter.key}:${filter.value}` || f === `NOT ${filter.key}:${filter.value}`;
+    });
+
+    if (existingIdx >= 0) {
+      // Toggle: remove existing filter
+      filters.splice(existingIdx, 1);
+    } else {
+      // Remove any existing filter for the same key (opposite operator)
+      const oppositeIdx = filters.findIndex((f) => {
+        return f === `${filter.key}:${filter.value}` || f === `NOT ${filter.key}:${filter.value}`;
+      });
+      if (oppositeIdx >= 0) {
+        filters.splice(oppositeIdx, 1);
+      }
+      filters.push(newFilter);
+    }
+
+    return { ...query, query: buildQuery(filters) };
+  }
+
+  queryHasFilter(
+    query: QuickwitQuery,
+    filter: { key: string; value: string; operator?: string }
+  ): boolean {
+    const currentQuery = query.query || '*';
+    const isExclude = filter.operator === '!=';
+    const filterStr = isExclude ? `NOT ${filter.key}:${filter.value}` : `${filter.key}:${filter.value}`;
+    return currentQuery.includes(filterStr);
+  }
+
+  // ================================================================
+  //  DataSourceWithQueryModificationSupport (duck-typed)
+  //  This enables "Add to query" / "Exclude from query" in log details.
+  // ================================================================
+
+  modifyQuery(query: QuickwitQuery, action: { type: string; options?: any }): QuickwitQuery {
+    const currentQuery = query.query || '*';
+    const filters = parseFilters(currentQuery);
+
+    switch (action.type) {
+      case 'ADD_FILTER': {
+        const { key, value } = action.options || {};
+        if (key && value !== undefined) {
+          const newFilter = `${key}:${value}`;
+          if (!filters.includes(newFilter)) {
+            filters.push(newFilter);
+          }
+        }
+        break;
+      }
+      case 'ADD_FILTER_OUT': {
+        const { key, value } = action.options || {};
+        if (key && value !== undefined) {
+          const newFilter = `NOT ${key}:${value}`;
+          // Remove any positive filter for same key:value
+          const posIdx = filters.indexOf(`${key}:${value}`);
+          if (posIdx >= 0) filters.splice(posIdx, 1);
+          if (!filters.includes(newFilter)) {
+            filters.push(newFilter);
+          }
+        }
+        break;
+      }
+    }
+
+    return { ...query, query: buildQuery(filters) };
+  }
+
+  getSupportedQueryModifications(): string[] {
+    return ['ADD_FILTER', 'ADD_FILTER_OUT'];
+  }
+
+  // ================================================================
   //  MAIN QUERY DISPATCHER
   // ================================================================
 
@@ -207,6 +334,12 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       .filter((t) => !t.hide)
       .map((target) => {
         const q = { ...defaultQuery, ...target } as QuickwitQuery;
+
+        // Handle supplementary logs volume query
+        if (q._isLogsVolume) {
+          return this.queryLogsVolume(q, options);
+        }
+
         switch (q.queryType) {
           case QueryType.Traces:
             return this.queryTraceSearch(q, options);
@@ -261,7 +394,12 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     }
 
     const indexes = await this.getIndexes();
-    const idx = indexes.find((i) => i.index_config.index_id === indexId);
+    let idx = indexes.find((i) => i.index_config.index_id === indexId);
+    // Wildcard match
+    if (!idx && indexId.includes('*')) {
+      const prefix = indexId.replace(/\*/g, '');
+      idx = indexes.find((i) => i.index_config.index_id.startsWith(prefix));
+    }
     if (!idx) return [];
 
     const fields = flattenFieldMappings(idx.index_config.doc_mapping.field_mappings);
@@ -269,8 +407,103 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     return fields;
   }
 
+  /**
+   * Get the timestamp field for an index, with caching.
+   */
+  private async getTimestampField(indexId: string): Promise<string> {
+    if (this.tsFieldCache.has(indexId)) {
+      return this.tsFieldCache.get(indexId)!;
+    }
+    const indexes = await this.getIndexes();
+    const tsField = detectTimestampField(indexes, indexId);
+    this.tsFieldCache.set(indexId, tsField);
+    return tsField;
+  }
+
   // ================================================================
-  //  LOG QUERIES (with embedded histogram)
+  //  LOGS VOLUME (supplementary query for histogram)
+  //  This is called by Grafana automatically for full-range histogram.
+  // ================================================================
+
+  private async queryLogsVolume(
+    query: QuickwitQuery,
+    options: DataQueryRequest<QuickwitQuery>
+  ): Promise<MutableDataFrame[]> {
+    const index = query.index || this.logIndex || this.defaultIndex;
+    if (!index) return [];
+
+    const fromMs = options.range.from.valueOf();
+    const toMs = options.range.to.valueOf();
+    const tsField = await this.getTimestampField(index);
+    const interval = computeAutoInterval(fromMs, toMs);
+    const lucene = getTemplateSrv().replace(query.query || '*', options.scopedVars);
+
+    const body = {
+      query: lucene,
+      max_hits: 0,
+      start_timestamp: Math.floor(fromMs / 1000),
+      end_timestamp: Math.ceil(toMs / 1000),
+      aggs: {
+        time_histogram: {
+          date_histogram: {
+            field: tsField,
+            fixed_interval: interval,
+          },
+        },
+      },
+    };
+
+    try {
+      const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
+      const buckets = resp?.aggregations?.time_histogram?.buckets || [];
+
+      const times: number[] = [];
+      const values: number[] = [];
+      for (const b of buckets) {
+        times.push(bucketKeyToMs(b.key));
+        values.push(b.doc_count);
+      }
+
+      // If no buckets, return empty frame with correct meta
+      if (times.length === 0) {
+        times.push(fromMs);
+        values.push(0);
+      }
+
+      const frame = new MutableDataFrame({
+        refId: query.refId,
+        meta: {
+          preferredVisualisationType: 'graph',
+          custom: {
+            logsVolumeType: LogsVolumeType.FullRange,
+            absoluteRange: { from: fromMs, to: toMs },
+            datasourceName: this.name,
+            sourceQuery: query,
+          },
+        },
+        fields: [
+          { name: 'Time', type: FieldType.time, values: times },
+          {
+            name: 'Volume',
+            type: FieldType.number,
+            values,
+            config: {
+              displayNameFromDS: 'Log Volume',
+              color: { mode: 'fixed', fixedColor: 'green' },
+            },
+          },
+        ],
+      });
+
+      return [frame];
+    } catch (e) {
+      console.error('Logs volume query failed:', e);
+      return [];
+    }
+  }
+
+  // ================================================================
+  //  LOG QUERIES
   // ================================================================
 
   private async queryLogs(
@@ -282,51 +515,28 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
 
     const fromMs = options.range.from.valueOf();
     const toMs = options.range.to.valueOf();
-    const from = fromMs / 1000;
-    const to = toMs / 1000;
+    const tsField = await this.getTimestampField(index);
     const lucene = getTemplateSrv().replace(query.query || '*', options.scopedVars);
 
-    const indexes = await this.getIndexes();
-    const tsField = detectTimestampField(indexes, index);
-    const interval = computeAutoInterval(fromMs, toMs);
-
-    // Build request body: search + histogram aggregation in ONE request
     const body: Record<string, any> = {
       query: lucene,
       max_hits: query.size || 100,
-      start_timestamp: Math.floor(from),
-      end_timestamp: Math.ceil(to),
+      start_timestamp: Math.floor(fromMs / 1000),
+      end_timestamp: Math.ceil(toMs / 1000),
       sort_by: `${tsField}:desc`,
-      aggs: {
-        time_histogram: {
-          date_histogram: {
-            field: tsField,
-            fixed_interval: interval,
-          },
-        },
-      },
     };
 
     const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
     const frames: MutableDataFrame[] = [];
 
-    // --- Frame 1: Log entries ---
     if (resp?.hits?.length) {
       const msgField = this.logMessageField;
       const lvlField = this.logLevelField;
+
+      // Check if this index has trace_id field by looking at actual data
+      const fields = await this.getFields(index);
+      const hasTraceField = fields.includes('trace_id');
       const hasTraceIndex = !!this.traceIndex;
-
-      // Collect all unique label keys from all hits for dynamic columns
-      const allLabelKeys = new Set<string>();
-      const flattenedHits: Array<Record<string, string>> = [];
-
-      for (const hit of resp.hits) {
-        const flat = flattenObject(hit);
-        flattenedHits.push(flat);
-        for (const key of Object.keys(flat)) {
-          allLabelKeys.add(key);
-        }
-      }
 
       const frame = new MutableDataFrame({
         refId: query.refId,
@@ -344,8 +554,8 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
 
       for (let i = 0; i < resp.hits.length; i++) {
         const hit = resp.hits[i];
-        const flat = flattenedHits[i];
-        const ts = extractTimestamp(hit);
+        const flat = flattenObject(hit);
+        const ts = extractTimestamp(hit, tsField);
         const msg = getNestedValue(hit, msgField);
         const level = getNestedValue(hit, lvlField) || '';
         const traceId = getNestedValue(hit, 'trace_id') || '';
@@ -355,15 +565,15 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           timestamp: ts,
           body: typeof msg === 'string' ? msg : JSON.stringify(hit),
           severity: String(level),
-          id: `${ts}-${traceId}-${spanId}-${i}`,
+          id: `${ts}-${i}`,
           traceID: traceId,
           spanID: spanId,
           labels: flat,
         });
       }
 
-      // Trace link on traceID field
-      if (hasTraceIndex) {
+      // Only add trace link if this index actually has trace_id AND a trace index is configured
+      if (hasTraceField && hasTraceIndex) {
         const traceIdField = frame.fields.find((f) => f.name === 'traceID');
         if (traceIdField) {
           traceIdField.config = {
@@ -388,63 +598,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         }
       }
 
-      // Quick-filter link on severity field
-      const severityField = frame.fields.find((f) => f.name === 'severity');
-      if (severityField) {
-        severityField.config = {
-          ...severityField.config,
-          links: [{
-            title: 'Filter by severity: ${__value.raw}',
-            url: '',
-            internal: {
-              datasourceUid: this.uid,
-              datasourceName: this.name,
-              query: {
-                refId: query.refId,
-                queryType: QueryType.Logs,
-                query: `${lvlField}:\${__value.raw}`,
-                index: index,
-                size: query.size || 100,
-              } as any,
-            },
-          }],
-        };
-      }
-
       frames.push(frame);
-    }
-
-    // --- Frame 2: Histogram (full-range, not limited by max_hits) ---
-    if (resp?.aggregations?.time_histogram?.buckets?.length) {
-      const buckets = resp.aggregations.time_histogram.buckets as any[];
-      const times: number[] = [];
-      const values: number[] = [];
-
-      for (const b of buckets) {
-        times.push(bucketKeyToMs(b.key));
-        values.push(b.doc_count);
-      }
-
-      const histFrame = new MutableDataFrame({
-        refId: `${query.refId}-volume`,
-        meta: {
-          preferredVisualisationType: 'graph',
-          custom: { resultType: 'time_series' },
-        },
-        fields: [
-          { name: 'Time', type: FieldType.time, values: times },
-          {
-            name: 'Log Volume',
-            type: FieldType.number,
-            values,
-            config: {
-              displayNameFromDS: 'Log Volume',
-            },
-          },
-        ],
-      });
-
-      frames.push(histFrame);
     }
 
     return frames;
@@ -574,6 +728,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       });
     }
 
+    // Trace → Log link
     if (this.logIndex) {
       const traceIdField = frame.fields.find((f) => f.name === 'traceID');
       if (traceIdField) {
@@ -631,6 +786,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       });
     }
 
+    // Trace ID → detail link
     const traceIdField = frame.fields.find((f) => f.name === 'Trace ID');
     if (traceIdField) {
       traceIdField.config = {
@@ -647,29 +803,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
               index: this.traceIndex,
               traceId: '${__value.raw}',
               size: 100,
-            } as any,
-          },
-        }],
-      };
-    }
-
-    const serviceField = frame.fields.find((f) => f.name === 'Service');
-    if (serviceField) {
-      serviceField.config = {
-        links: [{
-          title: 'Filter by service: ${__value.raw}',
-          url: '',
-          internal: {
-            datasourceUid: this.uid,
-            datasourceName: this.name,
-            query: {
-              refId: 'service-filter',
-              queryType: QueryType.Traces,
-              query: '',
-              index: this.traceIndex,
-              serviceName: '${__value.raw}',
-              size: 100,
-              traceLimit: 20,
             } as any,
           },
         }],
@@ -716,23 +849,17 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
 
     const fromMs = options.range.from.valueOf();
     const toMs = options.range.to.valueOf();
-    const from = fromMs / 1000;
-    const to = toMs / 1000;
+    const tsField = await this.getTimestampField(index);
     const lucene = getTemplateSrv().replace(query.query || '*', options.scopedVars);
-
-    const indexes = await this.getIndexes();
-    const tsField = detectTimestampField(indexes, index);
     const interval = query.groupByInterval || computeAutoInterval(fromMs, toMs);
     const aggType = query.metricType || MetricAggType.Count;
 
-    // Build aggregation based on type
     const aggs: Record<string, any> = {};
 
     if (aggType === MetricAggType.Terms) {
-      // Terms aggregation: top-N values for a field
       const termsField = query.termsField || query.metricField;
       if (!termsField) {
-        return [this.buildErrorFrame(query.refId, 'Terms aggregation requires a field. Set "Terms Field" in the query editor.')];
+        return [this.buildErrorFrame(query.refId, 'Terms aggregation requires a field.')];
       }
       aggs.terms_agg = {
         terms: {
@@ -742,7 +869,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         },
       };
     } else {
-      // Time-based histogram aggregation
       aggs.time_histogram = {
         date_histogram: {
           field: tsField,
@@ -750,8 +876,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         },
       };
 
-      // Add sub-aggregation for non-count metrics
-      if (aggType !== MetricAggType.Count && aggType !== '__logs_volume__' && query.metricField) {
+      if (aggType !== MetricAggType.Count && query.metricField) {
         if (aggType === MetricAggType.Percentiles) {
           aggs.time_histogram.aggs = {
             metric: {
@@ -762,7 +887,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
             },
           };
         } else {
-          // avg, sum, min, max
           aggs.time_histogram.aggs = {
             metric: {
               [aggType]: { field: query.metricField },
@@ -775,20 +899,18 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     const body = {
       query: lucene,
       max_hits: 0,
-      start_timestamp: Math.floor(from),
-      end_timestamp: Math.ceil(to),
+      start_timestamp: Math.floor(fromMs / 1000),
+      end_timestamp: Math.ceil(toMs / 1000),
       aggs,
     };
 
     try {
       const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
 
-      // Handle terms aggregation
       if (aggType === MetricAggType.Terms && resp?.aggregations?.terms_agg?.buckets) {
         return this.buildTermsFrame(resp.aggregations.terms_agg.buckets, query);
       }
 
-      // Handle time histogram
       if (!resp?.aggregations?.time_histogram?.buckets?.length) {
         return [this.buildErrorFrame(query.refId,
           `No aggregation results. Ensure "${tsField}" is a fast field in index "${index}".`)];
@@ -816,17 +938,14 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         ? 'Count'
         : `${aggType}(${query.metricField || ''})`;
 
-      const frame = new MutableDataFrame({
+      return [new MutableDataFrame({
         refId: query.refId,
         fields: [
           { name: 'Time', type: FieldType.time, values: times },
           { name: label, type: FieldType.number, values },
         ],
-      });
-
-      return [frame];
+      })];
     } catch (e: any) {
-      console.error('Metrics query failed:', e);
       return [this.buildErrorFrame(query.refId,
         `Aggregation failed: ${e?.message || e}. Ensure "${tsField}" is a fast field.`)];
     }
@@ -850,28 +969,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       ],
     });
 
-    // Add filter link on the value column
-    const valueField = frame.fields[0];
-    if (valueField) {
-      valueField.config = {
-        links: [{
-          title: 'Filter by ${__value.raw}',
-          url: '',
-          internal: {
-            datasourceUid: this.uid,
-            datasourceName: this.name,
-            query: {
-              refId: query.refId,
-              queryType: QueryType.Logs,
-              query: `${query.termsField}:\${__value.raw}`,
-              index: query.index || this.logIndex || this.defaultIndex,
-              size: 100,
-            } as any,
-          },
-        }],
-      };
-    }
-
     return [frame];
   }
 
@@ -892,7 +989,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     }
 
     const field = query.metricField || '';
-    const frame = new MutableDataFrame({
+    return [new MutableDataFrame({
       refId: query.refId,
       fields: [
         { name: 'Time', type: FieldType.time, values: times },
@@ -901,9 +998,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         { name: `p95(${field})`, type: FieldType.number, values: p95 },
         { name: `p99(${field})`, type: FieldType.number, values: p99 },
       ],
-    });
-
-    return [frame];
+    })];
   }
 
   // ================================================================
@@ -952,7 +1047,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       const resp = await getBackendSrv().datasourceRequest({
         url: `${this.baseUrl}${path}`,
         method: 'GET',
-        // @ts-ignore
+        // @ts-ignore - signal is supported but not in the type definition
         signal: controller.signal,
       });
       return resp.data;

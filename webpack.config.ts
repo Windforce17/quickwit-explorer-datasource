@@ -86,7 +86,7 @@ const config = (env: Record<string, string>): Configuration => ({
               rules: [
                 {
                   search: '%VERSION%',
-                  replace: '1.1.0',
+                  replace: '1.0.0',
                 },
                 {
                   search: '%TODAY%',
