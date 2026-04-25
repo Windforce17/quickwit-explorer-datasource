@@ -625,7 +625,13 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
 
       const frame = new MutableDataFrame({
         refId: query.refId,
-        meta: { preferredVisualisationType: 'logs' },
+        meta: {
+          preferredVisualisationType: 'logs',
+          custom: {
+            // Hint for Grafana: only show these labels inline on log lines
+            displayedFields: [lvlField].filter(Boolean),
+          },
+        },
         fields: frameFields,
       });
 
@@ -638,13 +644,12 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         const traceId = getNestedValue(hit, 'trace_id') || '';
         const spanId = getNestedValue(hit, 'span_id') || '';
 
-        // Only include a small set of important labels to avoid visual clutter
-        // All other fields are accessible in the log detail view
-        const labels: Record<string, string> = {};
-        if (level) labels[lvlField] = String(level);
-        if (traceId) labels['trace_id'] = traceId;
-        const svcName = flat['service.name'] || flat['resource.service.name'] || '';
-        if (svcName) labels['service.name'] = svcName;
+        // Include ALL fields in labels so Table view and field picker work correctly
+        // Grafana uses labels to populate the left-side field list and Table columns
+        const labels: Record<string, string> = { ...flat };
+        // Remove fields that are already represented as dedicated frame columns
+        delete labels[tsField];
+        delete labels[msgField];
 
         frame.add({
           timestamp: ts,
