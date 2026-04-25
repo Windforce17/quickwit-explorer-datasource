@@ -14,11 +14,13 @@ import {
   QwSearchResponse,
   QwFieldMapping,
   JaegerTrace,
-  JaegerSpan,
   JaegerApiResponse,
   QueryType,
   defaultQuery,
 } from './types';
+
+/** Default timeout for trace lookups (ms) */
+const TRACE_TIMEOUT_MS = 5000;
 
 export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, QuickwitOptions> {
   baseUrl: string;
@@ -33,16 +35,19 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   private indexCache: { data: QwIndex[]; ts: number } | null = null;
   private readonly INDEX_CACHE_TTL = 30000; // 30s
 
+  // Cache for fields per index
+  private fieldCache: Map<string, { data: string[]; ts: number }> = new Map();
+  private readonly FIELD_CACHE_TTL = 60000; // 60s
+
   constructor(instanceSettings: DataSourceInstanceSettings<QuickwitOptions>) {
     super(instanceSettings);
-    // Grafana proxy URL: /api/datasources/proxy/{id}/qw/...
     this.baseUrl = instanceSettings.url ? `${instanceSettings.url}/qw` : '';
     this.quickwitUrl = instanceSettings.jsonData.quickwitUrl || '';
     this.defaultIndex = instanceSettings.jsonData.defaultIndex || '';
     this.logMessageField = instanceSettings.jsonData.logMessageField || 'body';
     this.logLevelField = instanceSettings.jsonData.logLevelField || 'severity_text';
-    this.traceIndex = instanceSettings.jsonData.traceIndex || 'otel-traces-v0_7';
-    this.logIndex = instanceSettings.jsonData.logIndex || 'otel-logs-v0_7';
+    this.traceIndex = instanceSettings.jsonData.traceIndex || '';
+    this.logIndex = instanceSettings.jsonData.logIndex || '';
   }
 
   // ================================================================
@@ -100,12 +105,23 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   }
 
   async getFields(indexId: string): Promise<string[]> {
+    if (!indexId) {
+      return [];
+    }
+    const now = Date.now();
+    const cached = this.fieldCache.get(indexId);
+    if (cached && now - cached.ts < this.FIELD_CACHE_TTL) {
+      return cached.data;
+    }
+
     const indexes = await this.getIndexes();
     const idx = indexes.find((i) => i.index_config.index_id === indexId);
     if (!idx) {
       return [];
     }
-    return flattenFieldMappings(idx.index_config.doc_mapping.field_mappings);
+    const fields = flattenFieldMappings(idx.index_config.doc_mapping.field_mappings);
+    this.fieldCache.set(indexId, { data: fields, ts: now });
+    return fields;
   }
 
   // ================================================================
@@ -139,6 +155,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
 
     const msgField = this.logMessageField;
     const lvlField = this.logLevelField;
+    const hasTraceIndex = !!this.traceIndex;
 
     const frame = new MutableDataFrame({
       refId: query.refId,
@@ -172,25 +189,52 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       });
     }
 
-    // Add trace link on traceID field
-    const traceIdField = frame.fields.find((f) => f.name === 'traceID');
-    if (traceIdField) {
-      traceIdField.config = {
-        ...traceIdField.config,
+    // Only add trace link if a trace index is configured
+    if (hasTraceIndex) {
+      const traceIdField = frame.fields.find((f) => f.name === 'traceID');
+      if (traceIdField) {
+        traceIdField.config = {
+          ...traceIdField.config,
+          links: [
+            {
+              title: 'View Trace',
+              url: '',
+              internal: {
+                datasourceUid: this.uid,
+                datasourceName: this.name,
+                query: {
+                  refId: 'trace-link',
+                  queryType: QueryType.TraceId,
+                  query: '',
+                  index: this.traceIndex,
+                  traceId: '${__value.raw}',
+                  size: 100,
+                } as any,
+              },
+            },
+          ],
+        };
+      }
+    }
+
+    // Add quick-filter data links on severity field
+    const severityField = frame.fields.find((f) => f.name === 'severity');
+    if (severityField) {
+      severityField.config = {
+        ...severityField.config,
         links: [
           {
-            title: 'View Trace',
+            title: 'Filter by severity: ${__value.raw}',
             url: '',
             internal: {
               datasourceUid: this.uid,
               datasourceName: this.name,
               query: {
-                refId: 'trace-link',
-                queryType: QueryType.TraceId,
-                query: '',
-                index: this.traceIndex,
-                traceId: '${__value.raw}',
-                size: 100,
+                refId: query.refId,
+                queryType: QueryType.Logs,
+                query: `${lvlField}:\${__value.raw}`,
+                index: index,
+                size: query.size || 100,
               } as any,
             },
           },
@@ -211,7 +255,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   ): Promise<MutableDataFrame[]> {
     const index = query.index || this.traceIndex;
     if (!index) {
-      return [];
+      return [this.buildTraceErrorFrame(query.refId, 'No trace index configured. Set a Trace Index in the data source settings.')];
     }
 
     const traceId = getTemplateSrv().replace(query.traceId || '', options.scopedVars);
@@ -220,17 +264,37 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     }
 
     try {
-      const resp = await this.get<JaegerApiResponse<JaegerTrace[]>>(
-        `/api/v1/${index}/jaeger/api/traces/${traceId}`
+      const resp = await this.getWithTimeout<JaegerApiResponse<JaegerTrace[]>>(
+        `/api/v1/${index}/jaeger/api/traces/${traceId}`,
+        TRACE_TIMEOUT_MS
       );
       if (!resp?.data?.length) {
-        return [];
+        return [this.buildTraceErrorFrame(query.refId, `Trace ${traceId} not found in index "${index}".`)];
       }
       return [this.jaegerTraceToFrame(resp.data[0], query.refId)];
-    } catch (e) {
-      console.error('Failed to fetch trace:', e);
-      return [];
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      if (msg.includes('timeout') || msg.includes('aborted')) {
+        return [this.buildTraceErrorFrame(query.refId, `Trace lookup timed out after ${TRACE_TIMEOUT_MS / 1000}s. The trace may not exist in index "${index}".`)];
+      }
+      return [this.buildTraceErrorFrame(query.refId, `Trace lookup failed: ${msg}`)];
     }
+  }
+
+  /**
+   * Build a simple frame that shows an error/notice message instead of hanging.
+   */
+  private buildTraceErrorFrame(refId: string, message: string): MutableDataFrame {
+    const frame = new MutableDataFrame({
+      refId,
+      meta: {
+        notices: [{ severity: 'warning' as any, text: message }],
+      },
+      fields: [
+        { name: 'message', type: FieldType.string, values: [message] },
+      ],
+    });
+    return frame;
   }
 
   private async queryTraceSearch(
@@ -239,7 +303,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   ): Promise<MutableDataFrame[]> {
     const index = query.index || this.traceIndex;
     if (!index) {
-      return [];
+      return [this.buildTraceErrorFrame(query.refId, 'No trace index configured.')];
     }
 
     // If traceId is provided, do direct lookup
@@ -274,25 +338,24 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     params.set('limit', String(query.traceLimit || 20));
 
     try {
-      const resp = await this.get<JaegerApiResponse<JaegerTrace[]>>(
-        `/api/v1/${index}/jaeger/api/traces?${params.toString()}`
+      const resp = await this.getWithTimeout<JaegerApiResponse<JaegerTrace[]>>(
+        `/api/v1/${index}/jaeger/api/traces?${params.toString()}`,
+        TRACE_TIMEOUT_MS * 2
       );
       if (!resp?.data?.length) {
-        return [];
+        return [this.buildTraceErrorFrame(query.refId, 'No traces found matching the search criteria.')];
       }
 
-      // Build search results table
       const table = this.buildTraceSearchTable(resp.data, query.refId);
       return [table];
-    } catch (e) {
-      console.error('Failed to search traces:', e);
-      return [];
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      return [this.buildTraceErrorFrame(query.refId, `Trace search failed: ${msg}`)];
     }
   }
 
   /**
    * Convert Jaeger trace to Grafana trace data frame.
-   * This is the key method that enables the built-in trace view.
    */
   private jaegerTraceToFrame(trace: JaegerTrace, refId: string): MutableDataFrame {
     const frame = new MutableDataFrame({
@@ -339,6 +402,33 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         tags: span.tags || [],
         warnings: span.warnings || [],
       });
+    }
+
+    // Add log link on each span if log index is configured
+    if (this.logIndex) {
+      const traceIdField = frame.fields.find((f) => f.name === 'traceID');
+      if (traceIdField) {
+        traceIdField.config = {
+          ...traceIdField.config,
+          links: [
+            {
+              title: 'View Logs for this Trace',
+              url: '',
+              internal: {
+                datasourceUid: this.uid,
+                datasourceName: this.name,
+                query: {
+                  refId: 'trace-to-log',
+                  queryType: QueryType.Logs,
+                  query: 'trace_id:${__value.raw}',
+                  index: this.logIndex,
+                  size: 100,
+                } as any,
+              },
+            },
+          ],
+        };
+      }
     }
 
     return frame;
@@ -410,6 +500,32 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       };
     }
 
+    // Add quick-filter on Service column
+    const serviceField = frame.fields.find((f) => f.name === 'Service');
+    if (serviceField) {
+      serviceField.config = {
+        links: [
+          {
+            title: 'Filter traces by service: ${__value.raw}',
+            url: '',
+            internal: {
+              datasourceUid: this.uid,
+              datasourceName: this.name,
+              query: {
+                refId: 'service-filter',
+                queryType: QueryType.Traces,
+                query: '',
+                index: this.traceIndex,
+                serviceName: '${__value.raw}',
+                size: 100,
+                traceLimit: 20,
+              } as any,
+            },
+          },
+        ],
+      };
+    }
+
     return frame;
   }
 
@@ -423,8 +539,9 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       return [];
     }
     try {
-      const resp = await this.get<JaegerApiResponse<string[]>>(
-        `/api/v1/${idx}/jaeger/api/services`
+      const resp = await this.getWithTimeout<JaegerApiResponse<string[]>>(
+        `/api/v1/${idx}/jaeger/api/services`,
+        TRACE_TIMEOUT_MS
       );
       return resp?.data || [];
     } catch {
@@ -438,8 +555,9 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       return [];
     }
     try {
-      const resp = await this.get<JaegerApiResponse<string[]>>(
-        `/api/v1/${idx}/jaeger/api/services/${encodeURIComponent(service)}/operations`
+      const resp = await this.getWithTimeout<JaegerApiResponse<string[]>>(
+        `/api/v1/${idx}/jaeger/api/services/${encodeURIComponent(service)}/operations`,
+        TRACE_TIMEOUT_MS
       );
       return resp?.data || [];
     } catch {
@@ -536,6 +654,28 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       method: 'GET',
     });
     return resp.data;
+  }
+
+  private async getWithTimeout<T>(path: string, timeoutMs: number): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const resp = await getBackendSrv().datasourceRequest({
+        url: `${this.baseUrl}${path}`,
+        method: 'GET',
+        // @ts-ignore - signal is supported but not in type defs
+        signal: controller.signal,
+      });
+      return resp.data;
+    } catch (e: any) {
+      if (e?.name === 'AbortError' || controller.signal.aborted) {
+        throw new Error(`Request timeout after ${timeoutMs}ms`);
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async post<T>(path: string, body: any): Promise<T> {
