@@ -605,7 +605,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       // Flatten all hits first to discover all field names
       const allFlat: Array<Record<string, string>> = [];
       const allFieldNames = new Set<string>();
-      const reservedFields = new Set(['timestamp', 'body', 'severity', 'id', 'traceID', 'spanID']);
+      const reservedFields = new Set(['timestamp', 'body', 'severity', 'id', 'trace_id', 'span_id']);
 
       for (const hit of resp.hits) {
         const flat = flattenObject(hit);
@@ -625,8 +625,11 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         { name: 'body', type: FieldType.string },
         { name: 'severity', type: FieldType.string },
         { name: 'id', type: FieldType.string },
-        { name: 'traceID', type: FieldType.string },
-        { name: 'spanID', type: FieldType.string },
+        // NOTE: Do NOT use 'traceID'/'spanID' as field names — Grafana treats them as
+        // magic names and auto-renders a Trace collapse panel that re-executes the
+        // entire log query on expand.  Using 'trace_id'/'span_id' avoids this.
+        { name: 'trace_id', type: FieldType.string },
+        { name: 'span_id', type: FieldType.string },
         { name: 'labels', type: FieldType.other },
       ];
 
@@ -664,37 +667,37 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           body: typeof msg === 'string' ? msg : JSON.stringify(hit),
           severity: String(level),
           id: `${ts}-${i}`,
-          traceID: traceId,
-          spanID: spanId,
+          trace_id: traceId,
+          span_id: spanId,
           labels,
         });
       }
 
-      // TEMPORARILY DISABLED for testing: trace link removed to verify if it causes re-query
-      // if (hasTraceField && hasTraceIndex) {
-      //   const traceIdField = frame.fields.find((f) => f.name === 'traceID');
-      //   if (traceIdField) {
-      //     traceIdField.config = {
-      //       ...traceIdField.config,
-      //       links: [{
-      //         title: 'View Trace',
-      //         url: '',
-      //         internal: {
-      //           datasourceUid: this.uid,
-      //           datasourceName: this.name,
-      //           query: {
-      //             refId: 'trace-link',
-      //             queryType: QueryType.TraceId,
-      //             query: '',
-      //             index: this.traceIndex,
-      //             traceId: '${__value.raw}',
-      //             size: 100,
-      //           } as any,
-      //         },
-      //       }],
-      //     };
-      //   }
-      // }
+      // Add trace link if this index has trace_id AND a trace index is configured
+      if (hasTraceField && hasTraceIndex) {
+        const traceIdField = frame.fields.find((f) => f.name === 'trace_id');
+        if (traceIdField) {
+          traceIdField.config = {
+            ...traceIdField.config,
+            links: [{
+              title: 'View Trace',
+              url: '',
+              internal: {
+                datasourceUid: this.uid,
+                datasourceName: this.name,
+                query: {
+                  refId: 'trace-link',
+                  queryType: QueryType.TraceId,
+                  query: '',
+                  index: this.traceIndex,
+                  traceId: '${__value.raw}',
+                  size: 100,
+                } as any,
+              },
+            }],
+          };
+        }
+      }
 
       frames.push(frame);
     }
