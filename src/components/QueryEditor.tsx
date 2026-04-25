@@ -292,7 +292,7 @@ export function QueryEditor(props: Props) {
   useEffect(() => {
     if (q.queryType === QueryType.Traces) {
       setServicesLoading(true);
-      datasource.getServices(q.index).then((svcs) => {
+      datasource.getServices(q.index || datasource.traceIndex).then((svcs) => {
         setServices([{ label: 'All', value: '' }, ...svcs.map((s) => ({ label: s, value: s }))]);
       }).catch(() => {
         setServices([{ label: 'All', value: '' }]);
@@ -305,7 +305,7 @@ export function QueryEditor(props: Props) {
   // Load operations when service changes
   useEffect(() => {
     if (q.queryType === QueryType.Traces && q.serviceName) {
-      datasource.getOperations(q.serviceName, q.index).then((ops) => {
+      datasource.getOperations(q.serviceName, q.index || datasource.traceIndex).then((ops) => {
         setOperations([{ label: 'All', value: '' }, ...ops.map((o) => ({ label: o, value: o }))]);
       });
     } else {
@@ -330,7 +330,19 @@ export function QueryEditor(props: Props) {
           <RadioButtonGroup
             options={queryTypeOptions}
             value={q.queryType || QueryType.Logs}
-            onChange={(v) => updateAndRun({ queryType: v })}
+            onChange={(v) => {
+              const patch: Partial<QuickwitQuery> = { queryType: v };
+              // Auto-switch index when changing query type
+              if ((v === QueryType.Traces || v === QueryType.TraceId) && datasource.traceIndex) {
+                patch.index = datasource.traceIndex;
+              } else if (v === QueryType.Logs || v === QueryType.Metrics) {
+                // Switch back to log/default index
+                if (q.index === datasource.traceIndex) {
+                  patch.index = datasource.logIndex || datasource.defaultIndex || '';
+                }
+              }
+              updateAndRun(patch);
+            }}
             size="sm"
           />
         </InlineField>
