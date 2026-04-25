@@ -273,6 +273,17 @@ export function QueryEditor(props: Props) {
   const update = (patch: Partial<QuickwitQuery>) => onChange({ ...q, ...patch } as QuickwitQuery);
   const updateAndRun = (patch: Partial<QuickwitQuery>) => { onChange({ ...q, ...patch } as QuickwitQuery); setTimeout(onRunQuery, 50); };
 
+  // Auto-set default index on first mount if not set
+  useEffect(() => {
+    if (!q.index) {
+      const defaultIdx = datasource.logIndex || datasource.defaultIndex || '';
+      if (defaultIdx) {
+        onChange({ ...q, index: defaultIdx } as QuickwitQuery);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Load indexes
   useEffect(() => {
     datasource.searchIndexes('').then((ids) => {
@@ -406,7 +417,7 @@ export function QueryEditor(props: Props) {
       {/* ============ TRACE ID LOOKUP ============ */}
       {q.queryType === QueryType.TraceId && (
         <InlineFieldRow>
-          <InlineField label="Trace ID" labelWidth={8} grow>
+          <InlineField label="Trace ID" labelWidth={10} grow>
             <Input
               value={q.traceId || ''}
               placeholder="Enter a trace ID"
@@ -422,12 +433,12 @@ export function QueryEditor(props: Props) {
       {q.queryType === QueryType.Traces && (
         <>
           <InlineFieldRow>
-            <InlineField label="Service" labelWidth={8}>
+            <InlineField label="Service" labelWidth={10}>
               <Select width={25} options={services} value={q.serviceName || ''}
                 onChange={(v) => updateAndRun({ serviceName: v.value || '' })}
                 placeholder="Select service..." isClearable isSearchable isLoading={servicesLoading} />
             </InlineField>
-            <InlineField label="Operation" labelWidth={8}>
+            <InlineField label="Operation" labelWidth={10}>
               <Select width={25} options={operations} value={q.operationName || ''}
                 onChange={(v) => updateAndRun({ operationName: v.value || '' })}
                 placeholder="Select operation..." isClearable disabled={!q.serviceName} />
@@ -441,12 +452,12 @@ export function QueryEditor(props: Props) {
             </InlineField>
           </InlineFieldRow>
           <InlineFieldRow>
-            <InlineField label="Min Dur" labelWidth={8}>
+            <InlineField label="Min Duration" labelWidth={12}>
               <Input width={12} value={q.minDuration || ''} placeholder="100ms"
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) => update({ minDuration: e.target.value })}
                 onBlur={onRunQuery} />
             </InlineField>
-            <InlineField label="Max Dur" labelWidth={8}>
+            <InlineField label="Max Duration" labelWidth={12}>
               <Input width={12} value={q.maxDuration || ''} placeholder="5s"
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) => update({ maxDuration: e.target.value })}
                 onBlur={onRunQuery} />
@@ -479,7 +490,7 @@ export function QueryEditor(props: Props) {
           </InlineFieldRow>
 
           <InlineFieldRow>
-            <InlineField label="Agg Type" labelWidth={8}>
+            <InlineField label="Agg Type" labelWidth={10}>
               <Select
                 width={20}
                 options={metricAggOptions}
@@ -553,7 +564,7 @@ export function QueryEditor(props: Props) {
           {/* Interval for time-based aggregations */}
           {!isTermsAgg && (
             <InlineFieldRow>
-              <InlineField label="Interval" labelWidth={8}>
+              <InlineField label="Interval" labelWidth={10}>
                 <Input
                   width={12}
                   value={q.groupByInterval || ''}

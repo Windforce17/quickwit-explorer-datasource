@@ -595,28 +595,56 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       const hasTraceField = fields.includes('trace_id');
       const hasTraceIndex = !!this.traceIndex;
 
+      // Flatten all hits first to discover all field names
+      const allFlat: Array<Record<string, string>> = [];
+      const allFieldNames = new Set<string>();
+      const reservedFields = new Set(['timestamp', 'body', 'severity', 'id', 'traceID', 'spanID']);
+
+      for (const hit of resp.hits) {
+        const flat = flattenObject(hit);
+        allFlat.push(flat);
+        for (const key of Object.keys(flat)) {
+          allFieldNames.add(key);
+        }
+      }
+
+      // Build dynamic field columns (exclude reserved names and known fields)
+      const extraFieldNames = Array.from(allFieldNames).filter(
+        (f) => !reservedFields.has(f) && f !== tsField && f !== msgField && f !== lvlField
+      ).sort();
+
+      const frameFields: any[] = [
+        { name: 'timestamp', type: FieldType.time },
+        { name: 'body', type: FieldType.string },
+        { name: 'severity', type: FieldType.string },
+        { name: 'id', type: FieldType.string },
+        { name: 'traceID', type: FieldType.string },
+        { name: 'spanID', type: FieldType.string },
+        { name: 'labels', type: FieldType.other },
+      ];
+
       const frame = new MutableDataFrame({
         refId: query.refId,
         meta: { preferredVisualisationType: 'logs' },
-        fields: [
-          { name: 'timestamp', type: FieldType.time },
-          { name: 'body', type: FieldType.string },
-          { name: 'severity', type: FieldType.string },
-          { name: 'id', type: FieldType.string },
-          { name: 'traceID', type: FieldType.string },
-          { name: 'spanID', type: FieldType.string },
-          { name: 'labels', type: FieldType.other },
-        ],
+        fields: frameFields,
       });
 
       for (let i = 0; i < resp.hits.length; i++) {
         const hit = resp.hits[i];
-        const flat = flattenObject(hit);
+        const flat = allFlat[i];
         const ts = extractTimestamp(hit, tsField);
         const msg = getNestedValue(hit, msgField);
         const level = getNestedValue(hit, lvlField) || '';
         const traceId = getNestedValue(hit, 'trace_id') || '';
         const spanId = getNestedValue(hit, 'span_id') || '';
+
+        // Only include a small set of important labels to avoid visual clutter
+        // All other fields are accessible in the log detail view
+        const labels: Record<string, string> = {};
+        if (level) labels[lvlField] = String(level);
+        if (traceId) labels['trace_id'] = traceId;
+        const svcName = flat['service.name'] || flat['resource.service.name'] || '';
+        if (svcName) labels['service.name'] = svcName;
 
         frame.add({
           timestamp: ts,
@@ -625,7 +653,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           id: `${ts}-${i}`,
           traceID: traceId,
           spanID: spanId,
-          labels: flat,
+          labels,
         });
       }
 
