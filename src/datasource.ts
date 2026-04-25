@@ -667,23 +667,26 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       if (hasTraceField && hasTraceIndex) {
         const traceIdField = frame.fields.find((f) => f.name === 'traceID');
         if (traceIdField) {
+          // Use a URL link instead of internal link to avoid Grafana auto-executing
+          // a trace query when expanding log details (which causes unnecessary re-queries).
+          // The link opens a new Explore pane with the trace query.
+          const traceExploreQuery = JSON.stringify({
+            refId: 'trace-link',
+            queryType: QueryType.TraceId,
+            query: '',
+            index: this.traceIndex,
+            traceId: '${__value.raw}',
+            size: 100,
+            datasource: { type: 'quickwit-explorer-datasource', uid: this.uid },
+          });
+          const traceExploreUrl = `/explore?schemaVersion=1&panes=${encodeURIComponent(JSON.stringify({ trace: { datasource: this.uid, queries: [JSON.parse(traceExploreQuery)], range: { from: 'now-1h', to: 'now' } } }))}&orgId=1`;
+
           traceIdField.config = {
             ...traceIdField.config,
             links: [{
               title: 'View Trace',
-              url: '',
-              internal: {
-                datasourceUid: this.uid,
-                datasourceName: this.name,
-                query: {
-                  refId: 'trace-link',
-                  queryType: QueryType.TraceId,
-                  query: '',
-                  index: this.traceIndex,
-                  traceId: '${__value.raw}',
-                  size: 100,
-                } as any,
-              },
+              url: traceExploreUrl,
+              targetBlank: false,
             }],
           };
         }
