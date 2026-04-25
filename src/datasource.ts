@@ -581,7 +581,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       start_timestamp: Math.floor(fromMs / 1000),
       end_timestamp: Math.ceil(toMs / 1000),
       sort_by_field: tsField,
-      sort_order: 'Desc',
     };
 
     const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
