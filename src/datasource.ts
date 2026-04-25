@@ -365,6 +365,13 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           return this.queryLogsVolume(q, options);
         }
 
+        // Guard: if the target has a traceId, route to trace query regardless of queryType.
+        // This handles the case where Grafana resolves an internal data link and the
+        // queryType may be overridden by defaultQuery spread.
+        if (q.traceId) {
+          return this.queryTraceById({ ...q, queryType: QueryType.TraceId }, options);
+        }
+
         switch (q.queryType) {
           case QueryType.Traces:
             return this.queryTraceSearch(q, options);
@@ -663,34 +670,31 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         });
       }
 
-      // Only add trace link if this index actually has trace_id AND a trace index is configured
-      if (hasTraceField && hasTraceIndex) {
-        const traceIdField = frame.fields.find((f) => f.name === 'traceID');
-        if (traceIdField) {
-          // Use a URL link instead of internal link to avoid Grafana auto-executing
-          // a trace query when expanding log details (which causes unnecessary re-queries).
-          // The link opens a new Explore pane with the trace query.
-          const traceExploreQuery = JSON.stringify({
-            refId: 'trace-link',
-            queryType: QueryType.TraceId,
-            query: '',
-            index: this.traceIndex,
-            traceId: '${__value.raw}',
-            size: 100,
-            datasource: { type: 'quickwit-explorer-datasource', uid: this.uid },
-          });
-          const traceExploreUrl = `/explore?schemaVersion=1&panes=${encodeURIComponent(JSON.stringify({ trace: { datasource: this.uid, queries: [JSON.parse(traceExploreQuery)], range: { from: 'now-1h', to: 'now' } } }))}&orgId=1`;
-
-          traceIdField.config = {
-            ...traceIdField.config,
-            links: [{
-              title: 'View Trace',
-              url: traceExploreUrl,
-              targetBlank: false,
-            }],
-          };
-        }
-      }
+      // TEMPORARILY DISABLED for testing: trace link removed to verify if it causes re-query
+      // if (hasTraceField && hasTraceIndex) {
+      //   const traceIdField = frame.fields.find((f) => f.name === 'traceID');
+      //   if (traceIdField) {
+      //     traceIdField.config = {
+      //       ...traceIdField.config,
+      //       links: [{
+      //         title: 'View Trace',
+      //         url: '',
+      //         internal: {
+      //           datasourceUid: this.uid,
+      //           datasourceName: this.name,
+      //           query: {
+      //             refId: 'trace-link',
+      //             queryType: QueryType.TraceId,
+      //             query: '',
+      //             index: this.traceIndex,
+      //             traceId: '${__value.raw}',
+      //             size: 100,
+      //           } as any,
+      //         },
+      //       }],
+      //     };
+      //   }
+      // }
 
       frames.push(frame);
     }
