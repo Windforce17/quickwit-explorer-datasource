@@ -746,10 +746,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       return [this.buildErrorFrame(query.refId, 'No trace index configured.')];
     }
 
-    if (query.traceId) {
-      return this.queryTraceById({ ...query, queryType: QueryType.TraceId }, options);
-    }
-
     const params = new URLSearchParams();
     if (query.serviceName) {
       params.set('service', getTemplateSrv().replace(query.serviceName, options.scopedVars));
