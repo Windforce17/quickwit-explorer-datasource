@@ -9,6 +9,16 @@ export enum QueryType {
   Metrics = 'metrics',
 }
 
+export enum MetricAggType {
+  Count = 'count',
+  Avg = 'avg',
+  Sum = 'sum',
+  Min = 'min',
+  Max = 'max',
+  Percentiles = 'percentiles',
+  Terms = 'terms',
+}
+
 export interface QuickwitQuery extends DataQuery {
   /** Lucene query string */
   query: string;
@@ -24,26 +34,31 @@ export interface QuickwitQuery extends DataQuery {
   sortOrder?: 'asc' | 'desc';
 
   // Trace-specific fields
-  /** Direct trace ID lookup */
   traceId?: string;
-  /** Service name filter */
   serviceName?: string;
-  /** Operation name filter */
   operationName?: string;
-  /** Min duration filter (e.g. "100ms") */
   minDuration?: string;
-  /** Max duration filter (e.g. "5s") */
   maxDuration?: string;
-  /** Max number of traces to return */
   traceLimit?: number;
 
   // Metric-specific fields
-  /** Aggregation metric type */
+  /** Aggregation type */
   metricType?: string;
-  /** Group by field */
+  /** Field to aggregate on (for avg/sum/min/max/percentiles) */
+  metricField?: string;
+  /** Group by field (date_histogram field) */
   groupBy?: string;
   /** Date histogram interval */
   groupByInterval?: string;
+  /** Terms aggregation field (for top-N breakdown) */
+  termsField?: string;
+  /** Terms aggregation size */
+  termsSize?: number;
+  /** Sort order for results */
+  metricSortOrder?: 'asc' | 'desc';
+
+  // Internal: used by supplementary query
+  _isLogsVolume?: boolean;
 }
 
 export const defaultQuery: Partial<QuickwitQuery> = {
@@ -53,22 +68,17 @@ export const defaultQuery: Partial<QuickwitQuery> = {
   size: 100,
   sortOrder: 'desc',
   traceLimit: 20,
+  metricType: MetricAggType.Count,
 };
 
 // ==================== Datasource Config ====================
 
 export interface QuickwitOptions extends DataSourceJsonData {
-  /** Quickwit base URL for proxy routing */
   quickwitUrl?: string;
-  /** Default index */
   defaultIndex?: string;
-  /** Log message field name */
   logMessageField?: string;
-  /** Log level field name */
   logLevelField?: string;
-  /** Trace index name */
   traceIndex?: string;
-  /** Log index name */
   logIndex?: string;
 }
 
@@ -104,6 +114,9 @@ export interface QwFieldMapping {
   stored?: boolean;
   indexed?: boolean;
   field_mappings?: QwFieldMapping[];
+  // Quickwit object fields may also have sub-fields
+  record?: string;
+  tokenizer?: string;
 }
 
 export interface QwSearchResponse {
