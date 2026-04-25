@@ -240,47 +240,61 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   // ================================================================
   //  DataSourceWithToggleableQueryFiltersSupport (duck-typed)
   //  This enables +/- filter buttons on log field values in Explore.
+  //
+  //  Grafana calls toggleQueryFilter with a ToggleFilterAction:
+  //    { type: 'FILTER_FOR' | 'FILTER_OUT', options: { key, value } }
+  //  Grafana calls queryHasFilter with QueryFilterOptions:
+  //    { key, value }
   // ================================================================
 
   toggleQueryFilter(
     query: QuickwitQuery,
-    filter: { key: string; value: string; operator?: string }
+    filter: { type: string; options: Record<string, string> }
   ): QuickwitQuery {
     const currentQuery = query.query || '*';
     const filters = parseFilters(currentQuery);
-    const isExclude = filter.operator === '!=';
-    const newFilter = isExclude ? `NOT ${filter.key}:${filter.value}` : `${filter.key}:${filter.value}`;
+    const key = filter.options?.key;
+    const value = filter.options?.value;
 
-    // Check if this exact filter already exists
-    const existingIdx = filters.findIndex((f) => {
-      return f === newFilter || f === `${filter.key}:${filter.value}` || f === `NOT ${filter.key}:${filter.value}`;
-    });
+    if (!key || value === undefined) return query;
 
+    // Escape value if it contains spaces or special chars
+    const escapedValue = value.includes(' ') || value.includes('"') ? `"${value.replace(/"/g, '\\"')}"` : value;
+
+    const isExclude = filter.type === 'FILTER_OUT';
+    const positiveFilter = `${key}:${escapedValue}`;
+    const negativeFilter = `NOT ${key}:${escapedValue}`;
+    const newFilter = isExclude ? negativeFilter : positiveFilter;
+
+    // Check if this exact filter already exists (toggle off)
+    const existingIdx = filters.findIndex((f) => f === newFilter);
     if (existingIdx >= 0) {
-      // Toggle: remove existing filter
       filters.splice(existingIdx, 1);
-    } else {
-      // Remove any existing filter for the same key (opposite operator)
-      const oppositeIdx = filters.findIndex((f) => {
-        return f === `${filter.key}:${filter.value}` || f === `NOT ${filter.key}:${filter.value}`;
-      });
-      if (oppositeIdx >= 0) {
-        filters.splice(oppositeIdx, 1);
-      }
-      filters.push(newFilter);
+      return { ...query, query: buildQuery(filters) };
     }
 
+    // Remove opposite filter if present
+    const oppositeFilter = isExclude ? positiveFilter : negativeFilter;
+    const oppositeIdx = filters.findIndex((f) => f === oppositeFilter);
+    if (oppositeIdx >= 0) {
+      filters.splice(oppositeIdx, 1);
+    }
+
+    filters.push(newFilter);
     return { ...query, query: buildQuery(filters) };
   }
 
   queryHasFilter(
     query: QuickwitQuery,
-    filter: { key: string; value: string; operator?: string }
+    filter: Record<string, string>
   ): boolean {
     const currentQuery = query.query || '*';
-    const isExclude = filter.operator === '!=';
-    const filterStr = isExclude ? `NOT ${filter.key}:${filter.value}` : `${filter.key}:${filter.value}`;
-    return currentQuery.includes(filterStr);
+    const key = filter?.key;
+    const value = filter?.value;
+    if (!key || value === undefined) return false;
+
+    const escapedValue = value.includes(' ') || value.includes('"') ? `"${value.replace(/"/g, '\\"')}"` : value;
+    return currentQuery.includes(`${key}:${escapedValue}`);
   }
 
   // ================================================================
@@ -857,6 +871,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     const aggs: Record<string, any> = {};
 
     if (aggType === MetricAggType.Terms) {
+      // Pure terms aggregation (top values)
       const termsField = query.termsField || query.metricField;
       if (!termsField) {
         return [this.buildErrorFrame(query.refId, 'Terms aggregation requires a field.')];
@@ -868,7 +883,26 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           order: { _count: query.metricSortOrder || 'desc' },
         },
       };
+    } else if (aggType === MetricAggType.Count && query.groupBy) {
+      // Count grouped by a field: terms aggregation with date_histogram sub-aggregation
+      // This produces multiple time series, one per group value
+      aggs.group_terms = {
+        terms: {
+          field: query.groupBy,
+          size: query.termsSize || 10,
+          order: { _count: 'desc' },
+        },
+        aggs: {
+          time_histogram: {
+            date_histogram: {
+              field: tsField,
+              fixed_interval: interval,
+            },
+          },
+        },
+      };
     } else {
+      // Time-based histogram (Count without groupBy, or numeric aggregations)
       aggs.time_histogram = {
         date_histogram: {
           field: tsField,
@@ -909,6 +943,11 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
 
       if (aggType === MetricAggType.Terms && resp?.aggregations?.terms_agg?.buckets) {
         return this.buildTermsFrame(resp.aggregations.terms_agg.buckets, query);
+      }
+
+      // Handle Count grouped by field (terms → date_histogram)
+      if (aggType === MetricAggType.Count && query.groupBy && resp?.aggregations?.group_terms?.buckets) {
+        return this.buildGroupedCountFrame(resp.aggregations.group_terms.buckets, query);
       }
 
       if (!resp?.aggregations?.time_histogram?.buckets?.length) {
@@ -970,6 +1009,47 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     });
 
     return [frame];
+  }
+
+  /**
+   * Build multiple time series frames from grouped count aggregation.
+   * Each group value becomes a separate series.
+   */
+  private buildGroupedCountFrame(groupBuckets: any[], query: QuickwitQuery): MutableDataFrame[] {
+    const frames: MutableDataFrame[] = [];
+
+    for (const group of groupBuckets) {
+      const groupKey = String(group.key);
+      const timeBuckets = group.time_histogram?.buckets || [];
+      const times: number[] = [];
+      const values: number[] = [];
+
+      for (const b of timeBuckets) {
+        times.push(bucketKeyToMs(b.key));
+        values.push(b.doc_count);
+      }
+
+      if (times.length > 0) {
+        frames.push(new MutableDataFrame({
+          refId: query.refId,
+          fields: [
+            { name: 'Time', type: FieldType.time, values: times },
+            {
+              name: groupKey,
+              type: FieldType.number,
+              values,
+              config: { displayNameFromDS: `${query.groupBy}: ${groupKey}` },
+            },
+          ],
+        }));
+      }
+    }
+
+    if (frames.length === 0) {
+      return [this.buildErrorFrame(query.refId, `No data for group by "${query.groupBy}".`)];
+    }
+
+    return frames;
   }
 
   private buildPercentilesFrame(buckets: any[], query: QuickwitQuery): MutableDataFrame[] {

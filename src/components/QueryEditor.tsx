@@ -514,7 +514,25 @@ export function QueryEditor(props: Props) {
             )}
           </InlineFieldRow>
 
-          {/* Interval and sort for time-based aggregations */}
+          {/* Group By field for Count - allows counting by a specific field */}
+          {q.metricType === MetricAggType.Count && (
+            <InlineFieldRow>
+              <InlineField label="Group By" labelWidth={8} tooltip="Optional: group count by a field (uses terms aggregation)">
+                <Select
+                  width={25}
+                  options={[{ label: '-- None (time histogram) --', value: '' }, ...fieldOptions]}
+                  value={q.groupBy || ''}
+                  onChange={(v) => updateAndRun({ groupBy: v.value || '' })}
+                  placeholder="None (time histogram)"
+                  isSearchable
+                  isClearable
+                  allowCustomValue
+                />
+              </InlineField>
+            </InlineFieldRow>
+          )}
+
+          {/* Interval for time-based aggregations */}
           {!isTermsAgg && (
             <InlineFieldRow>
               <InlineField label="Interval" labelWidth={8}>
