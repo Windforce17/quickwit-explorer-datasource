@@ -377,6 +377,14 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
             return this.queryTraceSearch(q, options);
           case QueryType.TraceId:
             return this.queryTraceById(q, options);
+          case 'traceql' as any:
+            // Grafana's built-in LogLineDetailsTrace panel sends queryType 'traceql'
+            // (Tempo-style) with the trace ID in the `query` field.  Route it to our
+            // Jaeger-based trace lookup so the embedded trace view works correctly.
+            return this.queryTraceById(
+              { ...q, traceId: q.query, queryType: QueryType.TraceId, index: this.traceIndex || q.index },
+              options
+            );
           case QueryType.Metrics:
             return this.queryMetrics(q, options);
           case QueryType.Logs:
@@ -605,7 +613,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       // Flatten all hits first to discover all field names
       const allFlat: Array<Record<string, string>> = [];
       const allFieldNames = new Set<string>();
-      const reservedFields = new Set(['timestamp', 'body', 'severity', 'id', 'trace_id', 'span_id']);
+      const reservedFields = new Set(['timestamp', 'body', 'severity', 'id', 'traceID', 'spanID']);
 
       for (const hit of resp.hits) {
         const flat = flattenObject(hit);
@@ -625,11 +633,8 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         { name: 'body', type: FieldType.string },
         { name: 'severity', type: FieldType.string },
         { name: 'id', type: FieldType.string },
-        // NOTE: Do NOT use 'traceID'/'spanID' as field names — Grafana treats them as
-        // magic names and auto-renders a Trace collapse panel that re-executes the
-        // entire log query on expand.  Using 'trace_id'/'span_id' avoids this.
-        { name: 'trace_id', type: FieldType.string },
-        { name: 'span_id', type: FieldType.string },
+        { name: 'traceID', type: FieldType.string },
+        { name: 'spanID', type: FieldType.string },
         { name: 'labels', type: FieldType.other },
       ];
 
@@ -667,15 +672,15 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           body: typeof msg === 'string' ? msg : JSON.stringify(hit),
           severity: String(level),
           id: `${ts}-${i}`,
-          trace_id: traceId,
-          span_id: spanId,
+          traceID: traceId,
+          spanID: spanId,
           labels,
         });
       }
 
       // Add trace link if this index has trace_id AND a trace index is configured
       if (hasTraceField && hasTraceIndex) {
-        const traceIdField = frame.fields.find((f) => f.name === 'trace_id');
+        const traceIdField = frame.fields.find((f) => f.name === 'traceID');
         if (traceIdField) {
           traceIdField.config = {
             ...traceIdField.config,
