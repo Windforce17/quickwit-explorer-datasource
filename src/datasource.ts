@@ -24,7 +24,18 @@ import {
 } from './types';
 
 /** Default timeout for trace lookups (ms) */
-const TRACE_TIMEOUT_MS = 5000;
+const TRACE_TIMEOUT_MS = 8000;
+
+/** Safely extract error message from any error object */
+function extractErrorMessage(e: any): string {
+  if (!e) return 'Unknown error';
+  if (typeof e === 'string') return e;
+  if (e.data?.message) return e.data.message;
+  if (e.data?.error) return typeof e.data.error === 'string' ? e.data.error : JSON.stringify(e.data.error);
+  if (e.statusText) return `${e.status || ''} ${e.statusText}`.trim();
+  if (e.message) return e.message;
+  try { return JSON.stringify(e); } catch { return String(e); }
+}
 
 // ================================================================
 //  UTILITY FUNCTIONS
@@ -569,7 +580,8 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       max_hits: query.size || 100,
       start_timestamp: Math.floor(fromMs / 1000),
       end_timestamp: Math.ceil(toMs / 1000),
-      sort_by: `${tsField}:desc`,
+      sort_by_field: tsField,
+      sort_order: 'Desc',
     };
 
     const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
@@ -676,8 +688,8 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       }
       return [this.jaegerTraceToFrame(resp.data[0], query.refId)];
     } catch (e: any) {
-      const msg = e?.message || String(e);
-      if (msg.includes('timeout') || msg.includes('aborted')) {
+      const msg = extractErrorMessage(e);
+      if (msg.includes('timeout') || msg.includes('aborted') || msg.includes('Abort')) {
         return [this.buildErrorFrame(query.refId, `Trace lookup timed out. The trace may not exist.`)];
       }
       return [this.buildErrorFrame(query.refId, `Trace lookup failed: ${msg}`)];
@@ -726,7 +738,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       }
       return [this.buildTraceSearchTable(resp.data, query.refId)];
     } catch (e: any) {
-      return [this.buildErrorFrame(query.refId, `Trace search failed: ${e?.message || e}`)];
+      return [this.buildErrorFrame(query.refId, `Trace search failed: ${extractErrorMessage(e)}`)];
     }
   }
 
@@ -869,7 +881,10 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       const resp = await this.getWithTimeout<JaegerApiResponse<string[]>>(
         `/api/v1/${idx}/jaeger/api/services`, TRACE_TIMEOUT_MS);
       return resp?.data || [];
-    } catch { return []; }
+    } catch (e: any) {
+      console.error('getServices failed:', extractErrorMessage(e));
+      return [];
+    }
   }
 
   async getOperations(service: string, index?: string): Promise<string[]> {
@@ -879,7 +894,10 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       const resp = await this.getWithTimeout<JaegerApiResponse<string[]>>(
         `/api/v1/${idx}/jaeger/api/services/${encodeURIComponent(service)}/operations`, TRACE_TIMEOUT_MS);
       return resp?.data || [];
-    } catch { return []; }
+    } catch (e: any) {
+      console.error('getOperations failed:', extractErrorMessage(e));
+      return [];
+    }
   }
 
   // ================================================================
@@ -1018,7 +1036,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       })];
     } catch (e: any) {
       return [this.buildErrorFrame(query.refId,
-        `Aggregation failed: ${e?.message || e}. Ensure "${tsField}" is a fast field.`)];
+        `Aggregation failed: ${extractErrorMessage(e)}. Ensure "${tsField}" is a fast field.`)];
     }
   }
 

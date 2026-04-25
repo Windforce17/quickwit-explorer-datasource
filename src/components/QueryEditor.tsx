@@ -268,6 +268,7 @@ export function QueryEditor(props: Props) {
   const [fields, setFields] = useState<string[]>([]);
   const [services, setServices] = useState<Array<SelectableValue<string>>>([]);
   const [operations, setOperations] = useState<Array<SelectableValue<string>>>([]);
+  const [servicesLoading, setServicesLoading] = useState(false);
 
   const update = (patch: Partial<QuickwitQuery>) => onChange({ ...q, ...patch } as QuickwitQuery);
   const updateAndRun = (patch: Partial<QuickwitQuery>) => { onChange({ ...q, ...patch } as QuickwitQuery); setTimeout(onRunQuery, 50); };
@@ -290,8 +291,13 @@ export function QueryEditor(props: Props) {
   // Load services for trace queries
   useEffect(() => {
     if (q.queryType === QueryType.Traces) {
+      setServicesLoading(true);
       datasource.getServices(q.index).then((svcs) => {
         setServices([{ label: 'All', value: '' }, ...svcs.map((s) => ({ label: s, value: s }))]);
+      }).catch(() => {
+        setServices([{ label: 'All', value: '' }]);
+      }).finally(() => {
+        setServicesLoading(false);
       });
     }
   }, [q.queryType, q.index, datasource]);
@@ -407,7 +413,7 @@ export function QueryEditor(props: Props) {
             <InlineField label="Service" labelWidth={8}>
               <Select width={25} options={services} value={q.serviceName || ''}
                 onChange={(v) => updateAndRun({ serviceName: v.value || '' })}
-                placeholder="Select service..." isClearable isLoading={services.length <= 1} />
+                placeholder="Select service..." isClearable isSearchable isLoading={servicesLoading} />
             </InlineField>
             <InlineField label="Operation" labelWidth={8}>
               <Select width={25} options={operations} value={q.operationName || ''}
