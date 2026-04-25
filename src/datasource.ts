@@ -365,13 +365,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           return this.queryLogsVolume(q, options);
         }
 
-        // Guard: if the target has a traceId, route to trace query regardless of queryType.
-        // This handles the case where Grafana resolves an internal data link and the
-        // queryType may be overridden by defaultQuery spread.
-        if (q.traceId) {
-          return this.queryTraceById({ ...q, queryType: QueryType.TraceId }, options);
-        }
-
         switch (q.queryType) {
           case QueryType.Traces:
             return this.queryTraceSearch(q, options);
