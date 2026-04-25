@@ -3,8 +3,12 @@ import {
   DataQueryResponse,
   DataSourceApi,
   DataSourceInstanceSettings,
+  DataSourceWithSupplementaryQueriesSupport,
   FieldType,
+  LogLevel,
   MutableDataFrame,
+  SupplementaryQueryOptions,
+  SupplementaryQueryType,
 } from '@grafana/data';
 import { getBackendSrv, getTemplateSrv } from '@grafana/runtime';
 import {
@@ -22,7 +26,37 @@ import {
 /** Default timeout for trace lookups (ms) */
 const TRACE_TIMEOUT_MS = 5000;
 
-export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, QuickwitOptions> {
+/**
+ * Compute a reasonable histogram interval string based on the time range.
+ * Aims for roughly 50-80 buckets.
+ */
+function computeAutoInterval(fromMs: number, toMs: number): string {
+  const rangeSec = (toMs - fromMs) / 1000;
+  if (rangeSec <= 300) return '5s';        // <= 5min
+  if (rangeSec <= 1800) return '15s';      // <= 30min
+  if (rangeSec <= 7200) return '1m';       // <= 2h
+  if (rangeSec <= 21600) return '5m';      // <= 6h
+  if (rangeSec <= 86400) return '15m';     // <= 1d
+  if (rangeSec <= 604800) return '1h';     // <= 7d
+  if (rangeSec <= 2592000) return '6h';    // <= 30d
+  return '1d';
+}
+
+/**
+ * Detect the timestamp field name from index metadata.
+ */
+function detectTimestampField(indexes: QwIndex[], indexId: string): string {
+  const idx = indexes.find((i) => i.index_config.index_id === indexId);
+  if (idx?.index_config?.doc_mapping?.timestamp_field) {
+    return idx.index_config.doc_mapping.timestamp_field;
+  }
+  return 'timestamp';
+}
+
+export class QuickwitExplorerDatasource
+  extends DataSourceApi<QuickwitQuery, QuickwitOptions>
+  implements DataSourceWithSupplementaryQueriesSupport<QuickwitQuery>
+{
   baseUrl: string;
   quickwitUrl: string;
   defaultIndex: string;
@@ -48,6 +82,60 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     this.logLevelField = instanceSettings.jsonData.logLevelField || 'severity_text';
     this.traceIndex = instanceSettings.jsonData.traceIndex || '';
     this.logIndex = instanceSettings.jsonData.logIndex || '';
+  }
+
+  // ================================================================
+  //  SUPPLEMENTARY QUERIES (Logs Volume Histogram)
+  // ================================================================
+
+  getSupportedSupplementaryQueryTypes(): SupplementaryQueryType[] {
+    return [SupplementaryQueryType.LogsVolume];
+  }
+
+  getSupplementaryQuery(
+    options: SupplementaryQueryOptions,
+    query: QuickwitQuery
+  ): QuickwitQuery | undefined {
+    if (!this.getSupportedSupplementaryQueryTypes().includes(options.type)) {
+      return undefined;
+    }
+
+    // Only provide volume for log queries
+    if (query.queryType && query.queryType !== QueryType.Logs) {
+      return undefined;
+    }
+
+    switch (options.type) {
+      case SupplementaryQueryType.LogsVolume:
+        return {
+          ...query,
+          refId: `logs-volume-${query.refId}`,
+          queryType: QueryType.Metrics,
+          // We use a special marker so queryMetrics knows this is a volume query
+          metricType: '__logs_volume__',
+        };
+      default:
+        return undefined;
+    }
+  }
+
+  getSupplementaryRequest(
+    type: SupplementaryQueryType,
+    request: DataQueryRequest<QuickwitQuery>
+  ): DataQueryRequest<QuickwitQuery> | undefined {
+    if (!this.getSupportedSupplementaryQueryTypes().includes(type)) {
+      return undefined;
+    }
+
+    const targets = request.targets
+      .map((query) => this.getSupplementaryQuery({ type }, query))
+      .filter((query): query is QuickwitQuery => !!query);
+
+    if (!targets.length) {
+      return undefined;
+    }
+
+    return { ...request, targets };
   }
 
   // ================================================================
@@ -137,112 +225,123 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       return [];
     }
 
-    const from = options.range.from.valueOf() / 1000;
-    const to = options.range.to.valueOf() / 1000;
+    const fromMs = options.range.from.valueOf();
+    const toMs = options.range.to.valueOf();
+    const from = fromMs / 1000;
+    const to = toMs / 1000;
     const lucene = getTemplateSrv().replace(query.query || '*', options.scopedVars);
+
+    // Detect timestamp field from index metadata
+    const indexes = await this.getIndexes();
+    const tsField = detectTimestampField(indexes, index);
 
     const body: Record<string, any> = {
       query: lucene,
       max_hits: query.size || 100,
       start_timestamp: Math.floor(from),
       end_timestamp: Math.ceil(to),
+      sort_by: `${tsField}:desc`,
     };
 
     const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
-    if (!resp?.hits?.length) {
-      return [];
-    }
 
-    const msgField = this.logMessageField;
-    const lvlField = this.logLevelField;
-    const hasTraceIndex = !!this.traceIndex;
+    const frames: MutableDataFrame[] = [];
 
-    const frame = new MutableDataFrame({
-      refId: query.refId,
-      meta: { preferredVisualisationType: 'logs' },
-      fields: [
-        { name: 'timestamp', type: FieldType.time },
-        { name: 'body', type: FieldType.string },
-        { name: 'severity', type: FieldType.string },
-        { name: 'id', type: FieldType.string },
-        { name: 'traceID', type: FieldType.string },
-        { name: 'spanID', type: FieldType.string },
-        { name: 'labels', type: FieldType.other },
-      ],
-    });
+    // Build logs frame
+    if (resp?.hits?.length) {
+      const msgField = this.logMessageField;
+      const lvlField = this.logLevelField;
+      const hasTraceIndex = !!this.traceIndex;
 
-    for (const hit of resp.hits) {
-      const ts = extractTimestamp(hit);
-      const msg = getNestedValue(hit, msgField);
-      const level = getNestedValue(hit, lvlField) || '';
-      const traceId = getNestedValue(hit, 'trace_id') || '';
-      const spanId = getNestedValue(hit, 'span_id') || '';
-
-      frame.add({
-        timestamp: ts,
-        body: typeof msg === 'string' ? msg : JSON.stringify(hit),
-        severity: String(level),
-        id: `${ts}-${traceId}-${spanId}`,
-        traceID: traceId,
-        spanID: spanId,
-        labels: hit,
+      const frame = new MutableDataFrame({
+        refId: query.refId,
+        meta: { preferredVisualisationType: 'logs' },
+        fields: [
+          { name: 'timestamp', type: FieldType.time },
+          { name: 'body', type: FieldType.string },
+          { name: 'severity', type: FieldType.string },
+          { name: 'id', type: FieldType.string },
+          { name: 'traceID', type: FieldType.string },
+          { name: 'spanID', type: FieldType.string },
+          { name: 'labels', type: FieldType.other },
+        ],
       });
-    }
 
-    // Only add trace link if a trace index is configured
-    if (hasTraceIndex) {
-      const traceIdField = frame.fields.find((f) => f.name === 'traceID');
-      if (traceIdField) {
-        traceIdField.config = {
-          ...traceIdField.config,
+      for (const hit of resp.hits) {
+        const ts = extractTimestamp(hit);
+        const msg = getNestedValue(hit, msgField);
+        const level = getNestedValue(hit, lvlField) || '';
+        const traceId = getNestedValue(hit, 'trace_id') || '';
+        const spanId = getNestedValue(hit, 'span_id') || '';
+
+        frame.add({
+          timestamp: ts,
+          body: typeof msg === 'string' ? msg : JSON.stringify(hit),
+          severity: String(level),
+          id: `${ts}-${traceId}-${spanId}`,
+          traceID: traceId,
+          spanID: spanId,
+          labels: hit,
+        });
+      }
+
+      // Only add trace link if a trace index is configured
+      if (hasTraceIndex) {
+        const traceIdField = frame.fields.find((f) => f.name === 'traceID');
+        if (traceIdField) {
+          traceIdField.config = {
+            ...traceIdField.config,
+            links: [
+              {
+                title: 'View Trace',
+                url: '',
+                internal: {
+                  datasourceUid: this.uid,
+                  datasourceName: this.name,
+                  query: {
+                    refId: 'trace-link',
+                    queryType: QueryType.TraceId,
+                    query: '',
+                    index: this.traceIndex,
+                    traceId: '${__value.raw}',
+                    size: 100,
+                  } as any,
+                },
+              },
+            ],
+          };
+        }
+      }
+
+      // Add quick-filter data links on severity field
+      const severityField = frame.fields.find((f) => f.name === 'severity');
+      if (severityField) {
+        severityField.config = {
+          ...severityField.config,
           links: [
             {
-              title: 'View Trace',
+              title: 'Filter by severity: ${__value.raw}',
               url: '',
               internal: {
                 datasourceUid: this.uid,
                 datasourceName: this.name,
                 query: {
-                  refId: 'trace-link',
-                  queryType: QueryType.TraceId,
-                  query: '',
-                  index: this.traceIndex,
-                  traceId: '${__value.raw}',
-                  size: 100,
+                  refId: query.refId,
+                  queryType: QueryType.Logs,
+                  query: `${lvlField}:\${__value.raw}`,
+                  index: index,
+                  size: query.size || 100,
                 } as any,
               },
             },
           ],
         };
       }
+
+      frames.push(frame);
     }
 
-    // Add quick-filter data links on severity field
-    const severityField = frame.fields.find((f) => f.name === 'severity');
-    if (severityField) {
-      severityField.config = {
-        ...severityField.config,
-        links: [
-          {
-            title: 'Filter by severity: ${__value.raw}',
-            url: '',
-            internal: {
-              datasourceUid: this.uid,
-              datasourceName: this.name,
-              query: {
-                refId: query.refId,
-                queryType: QueryType.Logs,
-                query: `${lvlField}:\${__value.raw}`,
-                index: index,
-                size: query.size || 100,
-              } as any,
-            },
-          },
-        ],
-      };
-    }
-
-    return [frame];
+    return frames;
   }
 
   // ================================================================
@@ -281,9 +380,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     }
   }
 
-  /**
-   * Build a simple frame that shows an error/notice message instead of hanging.
-   */
   private buildTraceErrorFrame(refId: string, message: string): MutableDataFrame {
     const frame = new MutableDataFrame({
       refId,
@@ -306,7 +402,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       return [this.buildTraceErrorFrame(query.refId, 'No trace index configured.')];
     }
 
-    // If traceId is provided, do direct lookup
     if (query.traceId) {
       return this.queryTraceById(
         { ...query, queryType: QueryType.TraceId },
@@ -354,9 +449,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     }
   }
 
-  /**
-   * Convert Jaeger trace to Grafana trace data frame.
-   */
   private jaegerTraceToFrame(trace: JaegerTrace, refId: string): MutableDataFrame {
     const frame = new MutableDataFrame({
       refId,
@@ -434,9 +526,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     return frame;
   }
 
-  /**
-   * Build a table of trace search results with links to trace detail view.
-   */
   private buildTraceSearchTable(traces: JaegerTrace[], refId: string): MutableDataFrame {
     const frame = new MutableDataFrame({
       refId,
@@ -566,27 +655,37 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   }
 
   // ================================================================
-  //  METRIC QUERIES (aggregations)
+  //  METRIC / AGGREGATION QUERIES
   // ================================================================
 
   private async queryMetrics(
     query: QuickwitQuery,
     options: DataQueryRequest<QuickwitQuery>
   ): Promise<MutableDataFrame[]> {
+    // Determine which index to use
     const index = query.index || this.logIndex || this.defaultIndex;
     if (!index) {
       return [];
     }
 
-    const from = options.range.from.valueOf() / 1000;
-    const to = options.range.to.valueOf() / 1000;
+    const fromMs = options.range.from.valueOf();
+    const toMs = options.range.to.valueOf();
+    const from = fromMs / 1000;
+    const to = toMs / 1000;
     const lucene = getTemplateSrv().replace(query.query || '*', options.scopedVars);
 
-    const interval = query.groupByInterval || '30s';
+    // Detect timestamp field from index metadata
+    const indexes = await this.getIndexes();
+    const tsField = detectTimestampField(indexes, index);
+
+    // Compute interval
+    const interval = query.groupByInterval || computeAutoInterval(fromMs, toMs);
+    const groupByField = query.groupBy || tsField;
+
     const aggs: Record<string, any> = {
-      histogram: {
+      time_histogram: {
         date_histogram: {
-          field: query.groupBy || '_timestamp',
+          field: groupByField,
           fixed_interval: interval,
         },
       },
@@ -600,29 +699,81 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       aggs,
     };
 
-    const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
-    if (!resp?.aggregations?.histogram?.buckets) {
-      return [];
+    try {
+      const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
+
+      if (!resp?.aggregations?.time_histogram?.buckets) {
+        // If no aggregation results, return empty frame
+        return [new MutableDataFrame({
+          refId: query.refId,
+          fields: [
+            { name: 'Time', type: FieldType.time, values: [] },
+            { name: 'Count', type: FieldType.number, values: [] },
+          ],
+        })];
+      }
+
+      const buckets = resp.aggregations.time_histogram.buckets as any[];
+      const times: number[] = [];
+      const values: number[] = [];
+
+      for (const b of buckets) {
+        // Quickwit date_histogram returns key in milliseconds
+        let keyMs = b.key;
+        // Safety check: if key looks like microseconds (> year 2100 in ms), convert
+        if (keyMs > 4102444800000) {
+          keyMs = keyMs / 1000;
+        }
+        // If key looks like seconds
+        if (keyMs < 4102444800) {
+          keyMs = keyMs * 1000;
+        }
+        times.push(keyMs);
+        values.push(b.doc_count);
+      }
+
+      // For logs volume supplementary query, use special meta
+      const isLogsVolume = query.metricType === '__logs_volume__';
+
+      const frame = new MutableDataFrame({
+        refId: query.refId,
+        meta: isLogsVolume
+          ? {
+              custom: {
+                logsVolumeType: 'Full',
+              },
+            }
+          : undefined,
+        fields: [
+          { name: 'Time', type: FieldType.time, values: times },
+          {
+            name: isLogsVolume ? 'Volume' : 'Count',
+            type: FieldType.number,
+            values,
+            config: isLogsVolume
+              ? {
+                  displayNameFromDS: 'Log volume',
+                  color: { mode: 'fixed', fixedColor: 'green' },
+                }
+              : {},
+          },
+        ],
+      });
+
+      return [frame];
+    } catch (e: any) {
+      console.error('Metrics query failed:', e);
+      return [new MutableDataFrame({
+        refId: query.refId,
+        meta: {
+          notices: [{ severity: 'error' as any, text: `Aggregation query failed: ${e?.message || e}. Ensure the timestamp field is a "fast" field in Quickwit.` }],
+        },
+        fields: [
+          { name: 'Time', type: FieldType.time, values: [] },
+          { name: 'Count', type: FieldType.number, values: [] },
+        ],
+      })];
     }
-
-    const buckets = resp.aggregations.histogram.buckets as any[];
-    const times: number[] = [];
-    const values: number[] = [];
-
-    for (const b of buckets) {
-      times.push(b.key);
-      values.push(b.doc_count);
-    }
-
-    const frame = new MutableDataFrame({
-      refId: query.refId,
-      fields: [
-        { name: 'Time', type: FieldType.time, values: times },
-        { name: 'Count', type: FieldType.number, values },
-      ],
-    });
-
-    return [frame];
   }
 
   // ================================================================
