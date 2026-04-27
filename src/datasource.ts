@@ -948,17 +948,335 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     const index = query.index || this.logIndex || this.defaultIndex;
     if (!index) return [];
 
+    // Use new model if metrics[] and bucketAggs[] are present
+    if (query.metrics && query.metrics.length > 0 && query.bucketAggs && query.bucketAggs.length > 0) {
+      return this.queryMetricsNew(query, options);
+    }
+
+    // Legacy single-metric model
+    return this.queryMetricsLegacy(query, options);
+  }
+
+  // ================================================================
+  //  NEW METRICS MODEL: metrics[] + bucketAggs[]
+  // ================================================================
+
+  private async queryMetricsNew(
+    query: QuickwitQuery,
+    options: DataQueryRequest<QuickwitQuery>
+  ): Promise<MutableDataFrame[]> {
+    const index = query.index || this.logIndex || this.defaultIndex;
+    if (!index) return [];
+
+    const fromMs = options.range.from.valueOf();
+    const toMs = options.range.to.valueOf();
+    const tsField = await this.getTimestampField(index);
+    const lucene = getTemplateSrv().replace(query.query || '*', options.scopedVars);
+    const interval = query.groupByInterval || computeAutoInterval(fromMs, toMs);
+
+    const metrics = query.metrics!;
+    const bucketAggs = query.bucketAggs!;
+
+    // Build metric aggregation objects
+    const metricAggs: Record<string, any> = {};
+    for (const m of metrics) {
+      if (m.type === 'count') continue; // count is implicit via doc_count
+      if (!m.field) continue;
+      const aggKey = `metric_${m.id}`;
+      if (m.type === 'percentiles') {
+        const percents = m.settings?.percents?.map(Number) || [50, 90, 95, 99];
+        metricAggs[aggKey] = { percentiles: { field: m.field, percents } };
+      } else if (m.type === 'cardinality') {
+        metricAggs[aggKey] = { cardinality: { field: m.field } };
+      } else {
+        metricAggs[aggKey] = { [m.type]: { field: m.field } };
+      }
+    }
+
+    // Build nested bucket aggregations from inside out
+    // The last bucket agg is the innermost; it gets the metric sub-aggs
+    let currentAggs: Record<string, any> = { ...metricAggs };
+
+    // Process bucketAggs from last to first (inside out)
+    for (let i = bucketAggs.length - 1; i >= 0; i--) {
+      const bucket = bucketAggs[i];
+      const bucketKey = `bucket_${bucket.id}`;
+
+      if (bucket.type === 'date_histogram') {
+        const histInterval = bucket.settings?.interval || interval;
+        const bucketDef: any = {
+          date_histogram: {
+            field: bucket.field || tsField,
+            fixed_interval: histInterval,
+          },
+        };
+        if (Object.keys(currentAggs).length > 0) {
+          bucketDef.aggs = currentAggs;
+        }
+        currentAggs = { [bucketKey]: bucketDef };
+      } else if (bucket.type === 'terms') {
+        if (!bucket.field) continue;
+        const size = parseInt(bucket.settings?.size || '10', 10);
+        const order = bucket.settings?.order || 'desc';
+        const orderBy = bucket.settings?.orderBy || '_count';
+        const minDocCount = parseInt(bucket.settings?.min_doc_count || '1', 10);
+
+        // Resolve orderBy: if it references a metric id, use the metric key
+        let orderField = orderBy;
+        if (orderBy !== '_count' && orderBy !== '_key') {
+          // It's a metric id reference
+          orderField = `metric_${orderBy}`;
+        }
+
+        const bucketDef: any = {
+          terms: {
+            field: bucket.field,
+            size,
+            min_doc_count: minDocCount,
+            order: { [orderField]: order },
+          },
+        };
+        if (bucket.settings?.missing) {
+          bucketDef.terms.missing = bucket.settings.missing;
+        }
+        if (Object.keys(currentAggs).length > 0) {
+          bucketDef.aggs = currentAggs;
+        }
+        currentAggs = { [bucketKey]: bucketDef };
+      }
+    }
+
+    const body = {
+      query: lucene,
+      max_hits: 0,
+      start_timestamp: Math.floor(fromMs / 1000),
+      end_timestamp: Math.ceil(toMs / 1000),
+      aggs: currentAggs,
+    };
+
+    try {
+      const resp = await this.post<QwSearchResponse>(`/api/v1/${index}/search`, body);
+      if (!resp?.aggregations) {
+        return [this.buildErrorFrame(query.refId, 'No aggregation results returned.')];
+      }
+
+      // Parse the response based on bucket structure
+      return this.parseNewMetricsResponse(resp.aggregations, bucketAggs, metrics, query, tsField);
+    } catch (e: any) {
+      return [this.buildErrorFrame(query.refId,
+        `Aggregation failed: ${extractErrorMessage(e)}. Ensure fields are fast fields.`)];
+    }
+  }
+
+  /**
+   * Parse nested aggregation response into Grafana data frames.
+   * Handles: date_histogram (time series), terms (grouped), and combinations.
+   */
+  private parseNewMetricsResponse(
+    aggregations: Record<string, any>,
+    bucketAggs: import('./types').BucketAggregation[],
+    metrics: import('./types').MetricAggregation[],
+    query: QuickwitQuery,
+    tsField: string
+  ): MutableDataFrame[] {
+    const firstBucket = bucketAggs[0];
+    const firstBucketKey = `bucket_${firstBucket.id}`;
+    const firstBucketData = aggregations[firstBucketKey];
+
+    if (!firstBucketData?.buckets?.length) {
+      return [this.buildErrorFrame(query.refId, 'No aggregation buckets returned.')];
+    }
+
+    const buckets = firstBucketData.buckets;
+
+    // Case 1: Only date_histogram (no terms) → time series
+    if (bucketAggs.length === 1 && firstBucket.type === 'date_histogram') {
+      return this.buildNewTimeSeriesFrames(buckets, metrics, query, null);
+    }
+
+    // Case 2: Only terms (no date_histogram) → table
+    if (bucketAggs.length === 1 && firstBucket.type === 'terms') {
+      return this.buildNewTableFrame(buckets, firstBucket, metrics, query);
+    }
+
+    // Case 3: terms → date_histogram → metrics (grouped time series)
+    if (bucketAggs.length >= 2 && firstBucket.type === 'terms') {
+      const secondBucket = bucketAggs[1];
+      const secondBucketKey = `bucket_${secondBucket.id}`;
+      const frames: MutableDataFrame[] = [];
+
+      for (const termBucket of buckets) {
+        const groupKey = String(termBucket.key);
+        const innerBuckets = termBucket[secondBucketKey]?.buckets || [];
+
+        if (secondBucket.type === 'date_histogram') {
+          const groupFrames = this.buildNewTimeSeriesFrames(innerBuckets, metrics, query, groupKey);
+          frames.push(...groupFrames);
+        }
+      }
+
+      if (frames.length === 0) {
+        return [this.buildErrorFrame(query.refId, 'No data for grouped time series.')];
+      }
+      return frames;
+    }
+
+    // Case 4: date_histogram → terms (time series with sub-groups) - less common
+    // For now, treat as simple time series with the first metric
+    return this.buildNewTimeSeriesFrames(buckets, metrics, query, null);
+  }
+
+  /**
+   * Build time series frames from date_histogram buckets.
+   * If groupKey is provided, it's used as a prefix for series names.
+   */
+  private buildNewTimeSeriesFrames(
+    buckets: any[],
+    metrics: import('./types').MetricAggregation[],
+    query: QuickwitQuery,
+    groupKey: string | null
+  ): MutableDataFrame[] {
+    const frames: MutableDataFrame[] = [];
+    const times = buckets.map((b: any) => bucketKeyToMs(b.key));
+
+    for (const m of metrics) {
+      if (m.hide) continue;
+
+      if (m.type === 'count') {
+        const values = buckets.map((b: any) => b.doc_count);
+        const name = groupKey ? `Count [${groupKey}]` : 'Count';
+        frames.push(new MutableDataFrame({
+          refId: query.refId,
+          fields: [
+            { name: 'Time', type: FieldType.time, values: [...times] },
+            {
+              name,
+              type: FieldType.number,
+              values,
+              config: groupKey ? { displayNameFromDS: `Count: ${groupKey}` } : {},
+            },
+          ],
+        }));
+      } else if (m.type === 'percentiles') {
+        const metricKey = `metric_${m.id}`;
+        const percents = m.settings?.percents?.map(Number) || [50, 90, 95, 99];
+        for (const p of percents) {
+          const pKey = `${p}.0`;
+          const values = buckets.map((b: any) => b[metricKey]?.values?.[pKey] ?? 0);
+          const name = groupKey
+            ? `p${p}(${m.field}) [${groupKey}]`
+            : `p${p}(${m.field})`;
+          frames.push(new MutableDataFrame({
+            refId: query.refId,
+            fields: [
+              { name: 'Time', type: FieldType.time, values: [...times] },
+              {
+                name,
+                type: FieldType.number,
+                values,
+                config: groupKey ? { displayNameFromDS: `p${p}(${m.field}): ${groupKey}` } : {},
+              },
+            ],
+          }));
+        }
+      } else {
+        const metricKey = `metric_${m.id}`;
+        const values = buckets.map((b: any) => b[metricKey]?.value ?? 0);
+        const label = `${m.type}(${m.field})`;
+        const name = groupKey ? `${label} [${groupKey}]` : label;
+        frames.push(new MutableDataFrame({
+          refId: query.refId,
+          fields: [
+            { name: 'Time', type: FieldType.time, values: [...times] },
+            {
+              name,
+              type: FieldType.number,
+              values,
+              config: groupKey ? { displayNameFromDS: `${label}: ${groupKey}` } : {},
+            },
+          ],
+        }));
+      }
+    }
+
+    return frames;
+  }
+
+  /**
+   * Build a table frame from terms buckets with metric values.
+   */
+  private buildNewTableFrame(
+    buckets: any[],
+    termsBucket: import('./types').BucketAggregation,
+    metrics: import('./types').MetricAggregation[],
+    query: QuickwitQuery
+  ): MutableDataFrame[] {
+    const keys = buckets.map((b: any) => String(b.key));
+    const fields: any[] = [
+      { name: termsBucket.field || 'Group', type: FieldType.string, values: keys },
+    ];
+
+    for (const m of metrics) {
+      if (m.hide) continue;
+
+      if (m.type === 'count') {
+        fields.push({
+          name: 'Count',
+          type: FieldType.number,
+          values: buckets.map((b: any) => b.doc_count),
+        });
+      } else if (m.type === 'percentiles') {
+        const metricKey = `metric_${m.id}`;
+        const percents = m.settings?.percents?.map(Number) || [50, 90, 95, 99];
+        for (const p of percents) {
+          const pKey = `${p}.0`;
+          fields.push({
+            name: `p${p}(${m.field})`,
+            type: FieldType.number,
+            values: buckets.map((b: any) => b[metricKey]?.values?.[pKey] ?? 0),
+          });
+        }
+      } else {
+        const metricKey = `metric_${m.id}`;
+        fields.push({
+          name: `${m.type}(${m.field})`,
+          type: FieldType.number,
+          values: buckets.map((b: any) => b[metricKey]?.value ?? 0),
+        });
+      }
+    }
+
+    return [new MutableDataFrame({
+      refId: query.refId,
+      meta: { preferredVisualisationType: 'table' },
+      fields,
+    })];
+  }
+
+  // ================================================================
+  //  LEGACY METRICS MODEL (backward compatibility)
+  // ================================================================
+
+  private async queryMetricsLegacy(
+    query: QuickwitQuery,
+    options: DataQueryRequest<QuickwitQuery>
+  ): Promise<MutableDataFrame[]> {
+    const index = query.index || this.logIndex || this.defaultIndex;
+    if (!index) return [];
+
     const fromMs = options.range.from.valueOf();
     const toMs = options.range.to.valueOf();
     const tsField = await this.getTimestampField(index);
     const lucene = getTemplateSrv().replace(query.query || '*', options.scopedVars);
     const interval = query.groupByInterval || computeAutoInterval(fromMs, toMs);
     const aggType = query.metricType || MetricAggType.Count;
+    const displayMode = query.metricDisplayMode || 'timeSeries';
+    const hasGroupBy = !!query.groupBy;
+    const isNumericAgg = aggType !== MetricAggType.Count && aggType !== MetricAggType.Terms;
 
     const aggs: Record<string, any> = {};
 
     if (aggType === MetricAggType.Terms) {
-      // Pure terms aggregation (top values)
       const termsField = query.termsField || query.metricField;
       if (!termsField) {
         return [this.buildErrorFrame(query.refId, 'Terms aggregation requires a field.')];
@@ -970,48 +1288,63 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           order: { _count: query.metricSortOrder || 'desc' },
         },
       };
-    } else if (aggType === MetricAggType.Count && query.groupBy) {
-      // Count grouped by a field: terms aggregation with date_histogram sub-aggregation
-      // This produces multiple time series, one per group value
+    } else if (hasGroupBy && displayMode === 'table') {
+      const orderKey = isNumericAgg ? 'sub_metric' : '_count';
+      const orderDir = query.metricSortOrder || 'desc';
       aggs.group_terms = {
         terms: {
           field: query.groupBy,
-          size: query.termsSize || 10,
-          order: { _count: 'desc' },
+          size: query.termsSize || 20,
+          order: { [orderKey]: orderDir },
         },
-        aggs: {
-          time_histogram: {
-            date_histogram: {
-              field: tsField,
-              fixed_interval: interval,
+      };
+      if (isNumericAgg && query.metricField) {
+        if (aggType === MetricAggType.Percentiles) {
+          aggs.group_terms.aggs = {
+            sub_metric: {
+              percentiles: { field: query.metricField, percents: [50, 90, 95, 99] },
             },
-          },
+          };
+          aggs.group_terms.terms.order = { _count: orderDir };
+        } else {
+          aggs.group_terms.aggs = {
+            sub_metric: { [aggType]: { field: query.metricField } },
+          };
+        }
+      }
+    } else if (hasGroupBy) {
+      const subAggs: Record<string, any> = {
+        time_histogram: {
+          date_histogram: { field: tsField, fixed_interval: interval },
         },
+      };
+      if (isNumericAgg && query.metricField) {
+        if (aggType === MetricAggType.Percentiles) {
+          subAggs.time_histogram.aggs = {
+            metric: { percentiles: { field: query.metricField, percents: [50, 90, 95, 99] } },
+          };
+        } else {
+          subAggs.time_histogram.aggs = {
+            metric: { [aggType]: { field: query.metricField } },
+          };
+        }
+      }
+      aggs.group_terms = {
+        terms: { field: query.groupBy, size: query.termsSize || 10, order: { _count: 'desc' } },
+        aggs: subAggs,
       };
     } else {
-      // Time-based histogram (Count without groupBy, or numeric aggregations)
       aggs.time_histogram = {
-        date_histogram: {
-          field: tsField,
-          fixed_interval: interval,
-        },
+        date_histogram: { field: tsField, fixed_interval: interval },
       };
-
-      if (aggType !== MetricAggType.Count && query.metricField) {
+      if (isNumericAgg && query.metricField) {
         if (aggType === MetricAggType.Percentiles) {
           aggs.time_histogram.aggs = {
-            metric: {
-              percentiles: {
-                field: query.metricField,
-                percents: [50, 90, 95, 99],
-              },
-            },
+            metric: { percentiles: { field: query.metricField, percents: [50, 90, 95, 99] } },
           };
         } else {
           aggs.time_histogram.aggs = {
-            metric: {
-              [aggType]: { field: query.metricField },
-            },
+            metric: { [aggType]: { field: query.metricField } },
           };
         }
       }
@@ -1032,9 +1365,13 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         return this.buildTermsFrame(resp.aggregations.terms_agg.buckets, query);
       }
 
-      // Handle Count grouped by field (terms → date_histogram)
-      if (aggType === MetricAggType.Count && query.groupBy && resp?.aggregations?.group_terms?.buckets) {
-        return this.buildGroupedCountFrame(resp.aggregations.group_terms.buckets, query);
+      if (hasGroupBy && resp?.aggregations?.group_terms?.buckets) {
+        const groupBuckets = resp.aggregations.group_terms.buckets;
+        if (displayMode === 'table') {
+          return this.buildGroupedMetricTable(groupBuckets, query);
+        } else {
+          return this.buildGroupedTimeSeries(groupBuckets, query);
+        }
       }
 
       if (!resp?.aggregations?.time_histogram?.buckets?.length) {
@@ -1050,20 +1387,16 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
 
       const times: number[] = [];
       const values: number[] = [];
-
       for (const b of buckets) {
         times.push(bucketKeyToMs(b.key));
-        if (aggType !== MetricAggType.Count && b.metric) {
+        if (isNumericAgg && b.metric) {
           values.push(b.metric.value ?? 0);
         } else {
           values.push(b.doc_count);
         }
       }
 
-      const label = aggType === MetricAggType.Count
-        ? 'Count'
-        : `${aggType}(${query.metricField || ''})`;
-
+      const label = aggType === MetricAggType.Count ? 'Count' : `${aggType}(${query.metricField || ''})`;
       return [new MutableDataFrame({
         refId: query.refId,
         fields: [
@@ -1080,49 +1413,96 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   private buildTermsFrame(buckets: any[], query: QuickwitQuery): MutableDataFrame[] {
     const keys: string[] = [];
     const counts: number[] = [];
-
     for (const b of buckets) {
       keys.push(String(b.key));
       counts.push(b.doc_count);
     }
-
-    const frame = new MutableDataFrame({
+    return [new MutableDataFrame({
       refId: query.refId,
       meta: { preferredVisualisationType: 'table' },
       fields: [
         { name: query.termsField || 'Value', type: FieldType.string, values: keys },
         { name: 'Count', type: FieldType.number, values: counts },
       ],
-    });
-
-    return [frame];
+    })];
   }
 
-  /**
-   * Build multiple time series frames from grouped count aggregation.
-   * Each group value becomes a separate series.
-   */
-  private buildGroupedCountFrame(groupBuckets: any[], query: QuickwitQuery): MutableDataFrame[] {
+  private buildGroupedMetricTable(groupBuckets: any[], query: QuickwitQuery): MutableDataFrame[] {
+    const aggType = query.metricType || MetricAggType.Count;
+    const isNumericAgg = aggType !== MetricAggType.Count && aggType !== MetricAggType.Terms;
+    const keys: string[] = [];
+    const counts: number[] = [];
+    const metricValues: number[] = [];
+    const p50Vals: number[] = [];
+    const p90Vals: number[] = [];
+    const p95Vals: number[] = [];
+    const p99Vals: number[] = [];
+
+    for (const b of groupBuckets) {
+      keys.push(String(b.key));
+      counts.push(b.doc_count);
+      if (isNumericAgg && b.sub_metric) {
+        if (aggType === MetricAggType.Percentiles) {
+          const pvals = b.sub_metric?.values || {};
+          p50Vals.push(pvals['50.0'] ?? 0);
+          p90Vals.push(pvals['90.0'] ?? 0);
+          p95Vals.push(pvals['95.0'] ?? 0);
+          p99Vals.push(pvals['99.0'] ?? 0);
+        } else {
+          metricValues.push(b.sub_metric.value ?? 0);
+        }
+      }
+    }
+
+    const fields: any[] = [
+      { name: query.groupBy || 'Group', type: FieldType.string, values: keys },
+      { name: 'Count', type: FieldType.number, values: counts },
+    ];
+    if (isNumericAgg && query.metricField) {
+      if (aggType === MetricAggType.Percentiles) {
+        fields.push({ name: `p50(${query.metricField})`, type: FieldType.number, values: p50Vals });
+        fields.push({ name: `p90(${query.metricField})`, type: FieldType.number, values: p90Vals });
+        fields.push({ name: `p95(${query.metricField})`, type: FieldType.number, values: p95Vals });
+        fields.push({ name: `p99(${query.metricField})`, type: FieldType.number, values: p99Vals });
+      } else {
+        fields.push({ name: `${aggType}(${query.metricField})`, type: FieldType.number, values: metricValues });
+      }
+    }
+    return [new MutableDataFrame({
+      refId: query.refId,
+      meta: { preferredVisualisationType: 'table' },
+      fields,
+    })];
+  }
+
+  private buildGroupedTimeSeries(groupBuckets: any[], query: QuickwitQuery): MutableDataFrame[] {
     const frames: MutableDataFrame[] = [];
+    const aggType = query.metricType || MetricAggType.Count;
+    const isNumericAgg = aggType !== MetricAggType.Count && aggType !== MetricAggType.Terms;
 
     for (const group of groupBuckets) {
       const groupKey = String(group.key);
       const timeBuckets = group.time_histogram?.buckets || [];
       const times: number[] = [];
       const values: number[] = [];
-
       for (const b of timeBuckets) {
         times.push(bucketKeyToMs(b.key));
-        values.push(b.doc_count);
+        if (isNumericAgg && b.metric) {
+          values.push(b.metric.value ?? 0);
+        } else {
+          values.push(b.doc_count);
+        }
       }
-
       if (times.length > 0) {
+        const seriesName = isNumericAgg
+          ? `${aggType}(${query.metricField}) [${groupKey}]`
+          : `count [${groupKey}]`;
         frames.push(new MutableDataFrame({
           refId: query.refId,
           fields: [
             { name: 'Time', type: FieldType.time, values: times },
             {
-              name: groupKey,
+              name: seriesName,
               type: FieldType.number,
               values,
               config: { displayNameFromDS: `${query.groupBy}: ${groupKey}` },
@@ -1131,11 +1511,9 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         }));
       }
     }
-
     if (frames.length === 0) {
       return [this.buildErrorFrame(query.refId, `No data for group by "${query.groupBy}".`)];
     }
-
     return frames;
   }
 
@@ -1145,7 +1523,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     const p90: number[] = [];
     const p95: number[] = [];
     const p99: number[] = [];
-
     for (const b of buckets) {
       times.push(bucketKeyToMs(b.key));
       const pvals = b.metric?.values || {};
@@ -1154,7 +1531,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       p95.push(pvals['95.0'] ?? 0);
       p99.push(pvals['99.0'] ?? 0);
     }
-
     const field = query.metricField || '';
     return [new MutableDataFrame({
       refId: query.refId,

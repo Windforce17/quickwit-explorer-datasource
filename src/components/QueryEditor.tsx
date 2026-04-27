@@ -7,10 +7,16 @@ import {
   InlineFieldRow,
   RadioButtonGroup,
   Button,
+  IconButton,
   useTheme2,
+  Collapse,
 } from '@grafana/ui';
 import { QuickwitExplorerDatasource } from '../datasource';
-import { QuickwitQuery, QuickwitOptions, QueryType, MetricAggType, defaultQuery } from '../types';
+import {
+  QuickwitQuery, QuickwitOptions, QueryType, MetricAggType, MetricDisplayMode,
+  MetricAggregation, MetricAggregationType, BucketAggregation, BucketAggregationType,
+  defaultQuery, defaultMetrics, defaultBucketAggs,
+} from '../types';
 
 type Props = QueryEditorProps<QuickwitExplorerDatasource, QuickwitQuery, QuickwitOptions>;
 
@@ -37,19 +43,55 @@ const traceLimitOptions: Array<SelectableValue<number>> = [
   { label: '200', value: 200 },
 ];
 
-const metricAggOptions: Array<SelectableValue<string>> = [
-  { label: 'Count', value: MetricAggType.Count, description: 'Document count over time' },
-  { label: 'Average', value: MetricAggType.Avg, description: 'Average of a numeric field' },
-  { label: 'Sum', value: MetricAggType.Sum, description: 'Sum of a numeric field' },
-  { label: 'Min', value: MetricAggType.Min, description: 'Minimum value of a field' },
-  { label: 'Max', value: MetricAggType.Max, description: 'Maximum value of a field' },
-  { label: 'Percentiles', value: MetricAggType.Percentiles, description: 'p50/p90/p95/p99' },
-  { label: 'Top Values', value: MetricAggType.Terms, description: 'Top N values of a field' },
+const metricTypeOptions: Array<SelectableValue<MetricAggregationType>> = [
+  { label: 'Count', value: 'count' },
+  { label: 'Average', value: 'avg' },
+  { label: 'Sum', value: 'sum' },
+  { label: 'Min', value: 'min' },
+  { label: 'Max', value: 'max' },
+  { label: 'Percentiles', value: 'percentiles' },
+  { label: 'Unique Count', value: 'cardinality' },
+];
+
+const bucketTypeOptions: Array<SelectableValue<BucketAggregationType>> = [
+  { label: 'Terms', value: 'terms' },
+  { label: 'Date Histogram', value: 'date_histogram' },
+];
+
+const orderOptions: Array<SelectableValue<string>> = [
+  { label: 'Top', value: 'desc' },
+  { label: 'Bottom', value: 'asc' },
+];
+
+const sizeSelectOptions: Array<SelectableValue<string>> = [
+  { label: '5', value: '5' },
+  { label: '10', value: '10' },
+  { label: '15', value: '15' },
+  { label: '20', value: '20' },
+  { label: '50', value: '50' },
+  { label: '100', value: '100' },
+  { label: 'No limit', value: '0' },
+];
+
+// Legacy options for backward compat
+const legacyMetricAggOptions: Array<SelectableValue<string>> = [
+  { label: 'Count', value: MetricAggType.Count },
+  { label: 'Average', value: MetricAggType.Avg },
+  { label: 'Sum', value: MetricAggType.Sum },
+  { label: 'Min', value: MetricAggType.Min },
+  { label: 'Max', value: MetricAggType.Max },
+  { label: 'Percentiles', value: MetricAggType.Percentiles },
+  { label: 'Top Values', value: MetricAggType.Terms },
 ];
 
 const sortOrderOptions: Array<SelectableValue<string>> = [
   { label: 'Desc', value: 'desc' },
   { label: 'Asc', value: 'asc' },
+];
+
+const displayModeOptions: Array<SelectableValue<string>> = [
+  { label: 'Time Series', value: MetricDisplayMode.TimeSeries },
+  { label: 'Table', value: MetricDisplayMode.Table },
 ];
 
 const LUCENE_OPERATORS = ['AND', 'OR', 'NOT', 'TO'];
@@ -233,7 +275,6 @@ function QuickFilterBar({ query, fields, onChange, onRunQuery }: QuickFilterProp
     borderRadius: 12, fontSize: 11, fontFamily: 'monospace',
   };
 
-  // Show popular fields as quick-add buttons
   const popularFields = fields.slice(0, 8);
 
   return (
@@ -252,6 +293,274 @@ function QuickFilterBar({ query, fields, onChange, onRunQuery }: QuickFilterProp
           + {f}
         </span>
       ))}
+    </div>
+  );
+}
+
+// ================================================================
+//  METRIC ROW EDITOR
+// ================================================================
+
+interface MetricRowProps {
+  metric: MetricAggregation;
+  index: number;
+  fieldOptions: Array<SelectableValue<string>>;
+  onUpdate: (m: MetricAggregation) => void;
+  onRemove: () => void;
+  onToggleHide: () => void;
+  canRemove: boolean;
+}
+
+function MetricRow({ metric, index, fieldOptions, onUpdate, onRemove, onToggleHide, canRemove }: MetricRowProps) {
+  const theme = useTheme2();
+  const needsField = metric.type !== 'count';
+
+  const label = index === 0 ? 'Metric' : 'Then';
+
+  return (
+    <InlineFieldRow>
+      <InlineField label={label} labelWidth={10}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <IconButton
+            name={metric.hide ? 'eye-slash' : 'eye'}
+            size="sm"
+            tooltip={metric.hide ? 'Show metric' : 'Hide metric'}
+            onClick={onToggleHide}
+          />
+          {canRemove && (
+            <IconButton name="trash-alt" size="sm" tooltip="Remove metric" onClick={onRemove} />
+          )}
+        </div>
+      </InlineField>
+      <InlineField>
+        <Select
+          width={18}
+          options={metricTypeOptions}
+          value={metric.type}
+          onChange={(v) => onUpdate({ ...metric, type: v.value || 'count' })}
+        />
+      </InlineField>
+      {needsField && (
+        <InlineField>
+          <Select
+            width={25}
+            options={fieldOptions}
+            value={metric.field || ''}
+            onChange={(v) => onUpdate({ ...metric, field: v.value || '' })}
+            placeholder="Select field..."
+            isSearchable
+            allowCustomValue
+          />
+        </InlineField>
+      )}
+      {metric.type === 'percentiles' && (
+        <InlineField label="Percents" labelWidth={8}>
+          <Input
+            width={20}
+            value={(metric.settings?.percents || ['50', '90', '95', '99']).join(', ')}
+            placeholder="50, 90, 95, 99"
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+              const percents = e.target.value.split(',').map((s) => s.trim()).filter(Boolean);
+              onUpdate({ ...metric, settings: { ...metric.settings, percents } });
+            }}
+          />
+        </InlineField>
+      )}
+    </InlineFieldRow>
+  );
+}
+
+// ================================================================
+//  BUCKET AGG ROW EDITOR
+// ================================================================
+
+interface BucketRowProps {
+  bucket: BucketAggregation;
+  index: number;
+  fieldOptions: Array<SelectableValue<string>>;
+  metrics: MetricAggregation[];
+  onUpdate: (b: BucketAggregation) => void;
+  onRemove: () => void;
+  canRemove: boolean;
+  onRunQuery: () => void;
+}
+
+function BucketRow({ bucket, index, fieldOptions, metrics, onUpdate, onRemove, canRemove, onRunQuery }: BucketRowProps) {
+  const [showSettings, setShowSettings] = useState(false);
+  const label = index === 0 ? 'Group By' : 'Then By';
+
+  // Build order-by options: _count, _key, or any metric
+  const orderByOptions: Array<SelectableValue<string>> = [
+    { label: 'Doc Count', value: '_count' },
+    { label: 'Term value', value: '_key' },
+    ...metrics
+      .filter((m) => m.type !== 'count')
+      .map((m) => ({
+        label: `${m.type.charAt(0).toUpperCase() + m.type.slice(1)} ${m.field || ''}`,
+        value: m.id,
+      })),
+  ];
+
+  const settings = bucket.settings || {};
+
+  // Build summary string for collapsed settings
+  const summaryParts: string[] = [];
+  if (bucket.type === 'terms') {
+    const size = settings.size || '10';
+    if (size !== '0') summaryParts.push(`Top ${size}`);
+    else summaryParts.push('No limit');
+    if (settings.min_doc_count && settings.min_doc_count !== '1') {
+      summaryParts.push(`Min Doc Count: ${settings.min_doc_count}`);
+    }
+    if (settings.orderBy && settings.orderBy !== '_count') {
+      const orderLabel = orderByOptions.find((o) => o.value === settings.orderBy)?.label || settings.orderBy;
+      summaryParts.push(`Order by: ${orderLabel} (${settings.order || 'desc'})`);
+    }
+  } else if (bucket.type === 'date_histogram') {
+    if (settings.interval) summaryParts.push(`Interval: ${settings.interval}`);
+    else summaryParts.push('Interval: auto');
+  }
+  const summary = summaryParts.join(', ');
+
+  return (
+    <div style={{ marginBottom: 4 }}>
+      <InlineFieldRow>
+        <InlineField label={label} labelWidth={10}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            {canRemove && (
+              <IconButton name="trash-alt" size="sm" tooltip="Remove group by" onClick={onRemove} />
+            )}
+          </div>
+        </InlineField>
+        <InlineField>
+          <Select
+            width={16}
+            options={bucketTypeOptions}
+            value={bucket.type}
+            onChange={(v) => onUpdate({ ...bucket, type: v.value || 'date_histogram', settings: {} })}
+          />
+        </InlineField>
+        {bucket.type === 'terms' && (
+          <InlineField>
+            <Select
+              width={25}
+              options={fieldOptions}
+              value={bucket.field || ''}
+              onChange={(v) => { onUpdate({ ...bucket, field: v.value || '' }); onRunQuery(); }}
+              placeholder="Select Field"
+              isSearchable
+              allowCustomValue
+            />
+          </InlineField>
+        )}
+        {bucket.type === 'date_histogram' && (
+          <InlineField>
+            <Input
+              width={12}
+              value={settings.interval || ''}
+              placeholder="auto"
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                onUpdate({ ...bucket, settings: { ...settings, interval: e.target.value } })
+              }
+              onBlur={onRunQuery}
+            />
+          </InlineField>
+        )}
+        <div
+          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', fontSize: 12, marginLeft: 8, color: '#888' }}
+          onClick={() => setShowSettings(!showSettings)}
+        >
+          <span style={{ marginRight: 4 }}>{showSettings ? '▼' : '▶'}</span>
+          <span>{summary || 'Options'}</span>
+        </div>
+      </InlineFieldRow>
+
+      {showSettings && bucket.type === 'terms' && (
+        <div style={{ marginLeft: 80, padding: '8px 12px', borderLeft: '2px solid #444', marginBottom: 8 }}>
+          <InlineFieldRow>
+            <InlineField label="Order" labelWidth={12}>
+              <Select
+                width={12}
+                options={orderOptions}
+                value={settings.order || 'desc'}
+                onChange={(v) => { onUpdate({ ...bucket, settings: { ...settings, order: v.value as any } }); onRunQuery(); }}
+              />
+            </InlineField>
+            <InlineField label="Size" labelWidth={6}>
+              <Select
+                width={12}
+                options={sizeSelectOptions}
+                value={settings.size || '10'}
+                onChange={(v) => { onUpdate({ ...bucket, settings: { ...settings, size: v.value || '10' } }); onRunQuery(); }}
+                allowCustomValue
+              />
+            </InlineField>
+          </InlineFieldRow>
+          <InlineFieldRow>
+            <InlineField label="Min Doc Count" labelWidth={14}>
+              <Input
+                width={8}
+                type="number"
+                value={settings.min_doc_count || '1'}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  onUpdate({ ...bucket, settings: { ...settings, min_doc_count: e.target.value } })
+                }
+                onBlur={onRunQuery}
+              />
+            </InlineField>
+            <InlineField label="Order By" labelWidth={10}>
+              <Select
+                width={25}
+                options={orderByOptions}
+                value={settings.orderBy || '_count'}
+                onChange={(v) => { onUpdate({ ...bucket, settings: { ...settings, orderBy: v.value || '_count' } }); onRunQuery(); }}
+              />
+            </InlineField>
+          </InlineFieldRow>
+          <InlineFieldRow>
+            <InlineField label="Missing" labelWidth={12} tooltip="Value to use for documents missing this field">
+              <Input
+                width={15}
+                value={settings.missing || ''}
+                placeholder="(none)"
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  onUpdate({ ...bucket, settings: { ...settings, missing: e.target.value } })
+                }
+                onBlur={onRunQuery}
+              />
+            </InlineField>
+          </InlineFieldRow>
+        </div>
+      )}
+
+      {showSettings && bucket.type === 'date_histogram' && (
+        <div style={{ marginLeft: 80, padding: '8px 12px', borderLeft: '2px solid #444', marginBottom: 8 }}>
+          <InlineFieldRow>
+            <InlineField label="Interval" labelWidth={12}>
+              <Input
+                width={12}
+                value={settings.interval || ''}
+                placeholder="auto"
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  onUpdate({ ...bucket, settings: { ...settings, interval: e.target.value } })
+                }
+                onBlur={onRunQuery}
+              />
+            </InlineField>
+            <InlineField label="Min Doc Count" labelWidth={14}>
+              <Input
+                width={8}
+                type="number"
+                value={settings.min_doc_count_hist || '0'}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  onUpdate({ ...bucket, settings: { ...settings, min_doc_count_hist: e.target.value } })
+                }
+                onBlur={onRunQuery}
+              />
+            </InlineField>
+          </InlineFieldRow>
+        </div>
+      )}
     </div>
   );
 }
@@ -330,6 +639,70 @@ export function QueryEditor(props: Props) {
     [fields]
   );
 
+  // ==================== Metrics State Helpers ====================
+
+  // Determine if using new model or legacy
+  const useNewModel = !!(q.metrics && q.metrics.length > 0);
+
+  // Initialize metrics/bucketAggs if switching to Metrics for the first time
+  const ensureMetricsModel = () => {
+    if (!q.metrics || q.metrics.length === 0) {
+      update({ metrics: [...defaultMetrics], bucketAggs: [...defaultBucketAggs] });
+    }
+  };
+
+  // Generate next ID for metrics/buckets
+  const nextId = (): string => {
+    const allIds = [
+      ...(q.metrics || []).map((m) => parseInt(m.id, 10)),
+      ...(q.bucketAggs || []).map((b) => parseInt(b.id, 10)),
+    ];
+    return String(Math.max(0, ...allIds) + 1);
+  };
+
+  // Metric CRUD
+  const updateMetric = (idx: number, m: MetricAggregation) => {
+    const newMetrics = [...(q.metrics || [])];
+    newMetrics[idx] = m;
+    updateAndRun({ metrics: newMetrics });
+  };
+
+  const addMetric = () => {
+    const newMetrics = [...(q.metrics || []), { id: nextId(), type: 'count' as MetricAggregationType }];
+    update({ metrics: newMetrics });
+  };
+
+  const removeMetric = (idx: number) => {
+    const newMetrics = (q.metrics || []).filter((_, i) => i !== idx);
+    if (newMetrics.length === 0) newMetrics.push({ id: nextId(), type: 'count' });
+    updateAndRun({ metrics: newMetrics });
+  };
+
+  const toggleHideMetric = (idx: number) => {
+    const newMetrics = [...(q.metrics || [])];
+    newMetrics[idx] = { ...newMetrics[idx], hide: !newMetrics[idx].hide };
+    updateAndRun({ metrics: newMetrics });
+  };
+
+  // Bucket CRUD
+  const updateBucket = (idx: number, b: BucketAggregation) => {
+    const newBuckets = [...(q.bucketAggs || [])];
+    newBuckets[idx] = b;
+    update({ bucketAggs: newBuckets });
+  };
+
+  const addBucket = () => {
+    const newBuckets = [...(q.bucketAggs || []), { id: nextId(), type: 'terms' as BucketAggregationType, field: '' }];
+    update({ bucketAggs: newBuckets });
+  };
+
+  const removeBucket = (idx: number) => {
+    const newBuckets = (q.bucketAggs || []).filter((_, i) => i !== idx);
+    if (newBuckets.length === 0) newBuckets.push({ id: nextId(), type: 'date_histogram' });
+    updateAndRun({ bucketAggs: newBuckets });
+  };
+
+  // Legacy metrics helpers
   const needsMetricField = q.metricType && ![MetricAggType.Count, MetricAggType.Terms].includes(q.metricType as MetricAggType);
   const isTermsAgg = q.metricType === MetricAggType.Terms;
 
@@ -343,13 +716,18 @@ export function QueryEditor(props: Props) {
             value={q.queryType || QueryType.Logs}
             onChange={(v) => {
               const patch: Partial<QuickwitQuery> = { queryType: v };
-              // Auto-switch index when changing query type
               if ((v === QueryType.Traces || v === QueryType.TraceId) && datasource.traceIndex) {
                 patch.index = datasource.traceIndex;
               } else if (v === QueryType.Logs || v === QueryType.Metrics) {
-                // Switch back to log/default index
                 if (q.index === datasource.traceIndex) {
                   patch.index = datasource.logIndex || datasource.defaultIndex || '';
+                }
+              }
+              if (v === QueryType.Metrics) {
+                // Ensure new model is initialized
+                if (!q.metrics || q.metrics.length === 0) {
+                  patch.metrics = [...defaultMetrics];
+                  patch.bucketAggs = [...defaultBucketAggs];
                 }
               }
               updateAndRun(patch);
@@ -473,14 +851,76 @@ export function QueryEditor(props: Props) {
         </>
       )}
 
-      {/* ============ METRICS ============ */}
-      {q.queryType === QueryType.Metrics && (
+      {/* ============ METRICS (NEW MODEL) ============ */}
+      {q.queryType === QueryType.Metrics && useNewModel && (
+        <>
+          {/* Lucene Query */}
+          <InlineFieldRow>
+            <InlineField label="Query" labelWidth={10} grow>
+              <QueryInput
+                value={q.query || ''}
+                placeholder="Lucene filter (e.g. span_name:browser_manager.*)"
+                fields={fields}
+                onChange={(val) => update({ query: val })}
+                onRunQuery={onRunQuery}
+                rows={1}
+              />
+            </InlineField>
+          </InlineFieldRow>
+
+          {/* Metric Rows */}
+          {(q.metrics || []).map((m, i) => (
+            <MetricRow
+              key={m.id}
+              metric={m}
+              index={i}
+              fieldOptions={fieldOptions}
+              onUpdate={(updated) => updateMetric(i, updated)}
+              onRemove={() => removeMetric(i)}
+              onToggleHide={() => toggleHideMetric(i)}
+              canRemove={(q.metrics || []).length > 1}
+            />
+          ))}
+          <InlineFieldRow>
+            <InlineField label="" labelWidth={10}>
+              <Button variant="secondary" size="sm" icon="plus" onClick={addMetric}>
+                Add Metric
+              </Button>
+            </InlineField>
+          </InlineFieldRow>
+
+          {/* Bucket Agg Rows (Group By) */}
+          {(q.bucketAggs || []).map((b, i) => (
+            <BucketRow
+              key={b.id}
+              bucket={b}
+              index={i}
+              fieldOptions={fieldOptions}
+              metrics={q.metrics || []}
+              onUpdate={(updated) => updateBucket(i, updated)}
+              onRemove={() => removeBucket(i)}
+              canRemove={(q.bucketAggs || []).length > 1}
+              onRunQuery={onRunQuery}
+            />
+          ))}
+          <InlineFieldRow>
+            <InlineField label="" labelWidth={10}>
+              <Button variant="secondary" size="sm" icon="plus" onClick={addBucket}>
+                Add Group By
+              </Button>
+            </InlineField>
+          </InlineFieldRow>
+        </>
+      )}
+
+      {/* ============ METRICS (LEGACY MODEL - backward compat) ============ */}
+      {q.queryType === QueryType.Metrics && !useNewModel && (
         <>
           <InlineFieldRow>
             <InlineField label="Query" labelWidth={8} grow>
               <QueryInput
                 value={q.query || ''}
-                placeholder="Lucene filter (e.g. * for all)"
+                placeholder="Lucene filter (e.g. span_name:browser_manager.*)"
                 fields={fields}
                 onChange={(val) => update({ query: val })}
                 onRunQuery={onRunQuery}
@@ -493,13 +933,11 @@ export function QueryEditor(props: Props) {
             <InlineField label="Agg Type" labelWidth={10}>
               <Select
                 width={20}
-                options={metricAggOptions}
+                options={legacyMetricAggOptions}
                 value={q.metricType || MetricAggType.Count}
                 onChange={(v) => updateAndRun({ metricType: v.value || MetricAggType.Count })}
               />
             </InlineField>
-
-            {/* Field selector for avg/sum/min/max/percentiles */}
             {needsMetricField && (
               <InlineField label="Field" labelWidth={6}>
                 <Select
@@ -513,21 +951,46 @@ export function QueryEditor(props: Props) {
                 />
               </InlineField>
             )}
-
-            {/* Terms field selector */}
             {isTermsAgg && (
-              <>
-                <InlineField label="Field" labelWidth={6}>
+              <InlineField label="Field" labelWidth={6}>
+                <Select
+                  width={25}
+                  options={fieldOptions}
+                  value={q.termsField || ''}
+                  onChange={(v) => updateAndRun({ termsField: v.value || '' })}
+                  placeholder="Select field..."
+                  isSearchable
+                  allowCustomValue
+                />
+              </InlineField>
+            )}
+          </InlineFieldRow>
+
+          {!isTermsAgg && (
+            <InlineFieldRow>
+              <InlineField label="Group By" labelWidth={10}>
+                <Select
+                  width={25}
+                  options={[{ label: '-- None --', value: '' }, ...fieldOptions]}
+                  value={q.groupBy || ''}
+                  onChange={(v) => updateAndRun({ groupBy: v.value || '' })}
+                  placeholder="None"
+                  isSearchable
+                  isClearable
+                  allowCustomValue
+                />
+              </InlineField>
+              {q.groupBy && (
+                <InlineField label="Display" labelWidth={8}>
                   <Select
-                    width={25}
-                    options={fieldOptions}
-                    value={q.termsField || ''}
-                    onChange={(v) => updateAndRun({ termsField: v.value || '' })}
-                    placeholder="Select field..."
-                    isSearchable
-                    allowCustomValue
+                    width={16}
+                    options={displayModeOptions}
+                    value={q.metricDisplayMode || MetricDisplayMode.TimeSeries}
+                    onChange={(v) => updateAndRun({ metricDisplayMode: (v.value as MetricDisplayMode) || MetricDisplayMode.TimeSeries })}
                   />
                 </InlineField>
+              )}
+              {q.groupBy && (
                 <InlineField label="Top" labelWidth={4}>
                   <Input
                     width={8}
@@ -539,30 +1002,37 @@ export function QueryEditor(props: Props) {
                     onBlur={onRunQuery}
                   />
                 </InlineField>
-              </>
-            )}
-          </InlineFieldRow>
-
-          {/* Group By field for Count - allows counting by a specific field */}
-          {q.metricType === MetricAggType.Count && (
-            <InlineFieldRow>
-              <InlineField label="Group By" labelWidth={10} tooltip="Optional: group count by a field (uses terms aggregation)">
-                <Select
-                  width={25}
-                  options={[{ label: '-- None (time histogram) --', value: '' }, ...fieldOptions]}
-                  value={q.groupBy || ''}
-                  onChange={(v) => updateAndRun({ groupBy: v.value || '' })}
-                  placeholder="None (time histogram)"
-                  isSearchable
-                  isClearable
-                  allowCustomValue
-                />
-              </InlineField>
+              )}
             </InlineFieldRow>
           )}
 
-          {/* Interval for time-based aggregations */}
-          {!isTermsAgg && (
+          {(isTermsAgg || (q.groupBy && q.metricDisplayMode === MetricDisplayMode.Table)) && (
+            <InlineFieldRow>
+              <InlineField label="Sort" labelWidth={8}>
+                <Select
+                  width={12}
+                  options={sortOrderOptions}
+                  value={q.metricSortOrder || 'desc'}
+                  onChange={(v) => updateAndRun({ metricSortOrder: (v.value as 'asc' | 'desc') || 'desc' })}
+                />
+              </InlineField>
+              {isTermsAgg && (
+                <InlineField label="Top" labelWidth={4}>
+                  <Input
+                    width={8}
+                    type="number"
+                    value={q.termsSize || 10}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      update({ termsSize: parseInt(e.target.value, 10) || 10 })
+                    }
+                    onBlur={onRunQuery}
+                  />
+                </InlineField>
+              )}
+            </InlineFieldRow>
+          )}
+
+          {!isTermsAgg && !(q.groupBy && q.metricDisplayMode === MetricDisplayMode.Table) && (
             <InlineFieldRow>
               <InlineField label="Interval" labelWidth={10}>
                 <Input
@@ -578,19 +1048,14 @@ export function QueryEditor(props: Props) {
             </InlineFieldRow>
           )}
 
-          {/* Sort order for terms */}
-          {isTermsAgg && (
-            <InlineFieldRow>
-              <InlineField label="Sort" labelWidth={8}>
-                <Select
-                  width={12}
-                  options={sortOrderOptions}
-                  value={q.metricSortOrder || 'desc'}
-                  onChange={(v) => updateAndRun({ metricSortOrder: (v.value as 'asc' | 'desc') || 'desc' })}
-                />
-              </InlineField>
-            </InlineFieldRow>
-          )}
+          {/* Button to upgrade to new model */}
+          <InlineFieldRow>
+            <InlineField label="" labelWidth={10}>
+              <Button variant="secondary" size="sm" icon="arrow-up" onClick={ensureMetricsModel}>
+                Switch to Advanced Mode
+              </Button>
+            </InlineField>
+          </InlineFieldRow>
         </>
       )}
     </div>
