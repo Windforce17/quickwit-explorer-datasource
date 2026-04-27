@@ -379,6 +379,18 @@ function MetricRow({ metric, index, fieldOptions, onUpdate, onRemove, onToggleHi
           />
         </InlineField>
       )}
+      {needsField && (
+        <InlineField label="Missing" labelWidth={8}>
+          <Input
+            width={12}
+            value={metric.settings?.missing || ''}
+            placeholder=""
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+              onUpdate({ ...metric, settings: { ...metric.settings, missing: e.target.value } });
+            }}
+          />
+        </InlineField>
+      )}
     </InlineFieldRow>
   );
 }
@@ -894,13 +906,11 @@ export function QueryEditor(props: Props) {
               canRemove={(q.metrics || []).length > 1}
             />
           ))}
-          <InlineFieldRow>
-            <InlineField label="" labelWidth={10}>
-              <Button variant="secondary" size="sm" icon="plus" onClick={addMetric}>
-                Add Metric
-              </Button>
-            </InlineField>
-          </InlineFieldRow>
+          <div style={{ marginLeft: 10, marginBottom: 4 }}>
+            <Button variant="secondary" size="sm" icon="plus" onClick={addMetric}>
+              Add Metric
+            </Button>
+          </div>
 
           {/* Bucket Agg Rows (Group By) */}
           {(q.bucketAggs || []).map((b, i) => (
@@ -916,13 +926,11 @@ export function QueryEditor(props: Props) {
               onRunQuery={onRunQuery}
             />
           ))}
-          <InlineFieldRow>
-            <InlineField label="" labelWidth={10}>
-              <Button variant="secondary" size="sm" icon="plus" onClick={addBucket}>
-                Add Group By
-              </Button>
-            </InlineField>
-          </InlineFieldRow>
+          <div style={{ marginLeft: 10, marginBottom: 4 }}>
+            <Button variant="secondary" size="sm" icon="plus" onClick={addBucket}>
+              Add Group By
+            </Button>
+          </div>
         </>
       )}
 

@@ -985,11 +985,17 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       const aggKey = `metric_${m.id}`;
       if (m.type === 'percentiles') {
         const percents = m.settings?.percents?.map(Number) || [50, 90, 95, 99];
-        metricAggs[aggKey] = { percentiles: { field: m.field, percents } };
+        const pAgg: any = { field: m.field, percents };
+        if (m.settings?.missing) pAgg.missing = m.settings.missing;
+        metricAggs[aggKey] = { percentiles: pAgg };
       } else if (m.type === 'cardinality') {
-        metricAggs[aggKey] = { cardinality: { field: m.field } };
+        const cAgg: any = { field: m.field };
+        if (m.settings?.missing) cAgg.missing = m.settings.missing;
+        metricAggs[aggKey] = { cardinality: cAgg };
       } else {
-        metricAggs[aggKey] = { [m.type]: { field: m.field } };
+        const mAgg: any = { field: m.field };
+        if (m.settings?.missing) mAgg.missing = m.settings.missing;
+        metricAggs[aggKey] = { [m.type]: mAgg };
       }
     }
 
@@ -1099,30 +1105,79 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       return this.buildNewTableFrame(buckets, firstBucket, metrics, query);
     }
 
-    // Case 3: terms → date_histogram → metrics (grouped time series)
+    // Case 3: terms → (terms | date_histogram) → metrics (multi-level grouping)
     if (bucketAggs.length >= 2 && firstBucket.type === 'terms') {
       const secondBucket = bucketAggs[1];
       const secondBucketKey = `bucket_${secondBucket.id}`;
-      const frames: MutableDataFrame[] = [];
 
-      for (const termBucket of buckets) {
-        const groupKey = String(termBucket.key);
-        const innerBuckets = termBucket[secondBucketKey]?.buckets || [];
-
-        if (secondBucket.type === 'date_histogram') {
+      if (secondBucket.type === 'date_histogram') {
+        // terms → date_histogram → metrics (grouped time series)
+        const frames: MutableDataFrame[] = [];
+        for (const termBucket of buckets) {
+          const groupKey = String(termBucket.key);
+          const innerBuckets = termBucket[secondBucketKey]?.buckets || [];
           const groupFrames = this.buildNewTimeSeriesFrames(innerBuckets, metrics, query, groupKey);
           frames.push(...groupFrames);
         }
+        if (frames.length === 0) {
+          return [this.buildErrorFrame(query.refId, 'No data for grouped time series.')];
+        }
+        return frames;
       }
 
-      if (frames.length === 0) {
-        return [this.buildErrorFrame(query.refId, 'No data for grouped time series.')];
+      if (secondBucket.type === 'terms') {
+        // terms → terms → metrics (nested terms table)
+        return this.buildNestedTermsTable(buckets, firstBucket, secondBucket, secondBucketKey, metrics, query);
       }
-      return frames;
     }
 
-    // Case 4: date_histogram → terms (time series with sub-groups) - less common
-    // For now, treat as simple time series with the first metric
+    // Case 4: date_histogram → terms (time series with sub-groups)
+    if (bucketAggs.length >= 2 && firstBucket.type === 'date_histogram') {
+      const secondBucket = bucketAggs[1];
+      const secondBucketKey = `bucket_${secondBucket.id}`;
+      if (secondBucket.type === 'terms') {
+        // Flatten: for each terms value, build a time series
+        const seriesMap = new Map<string, { times: number[]; values: Map<string, number[]> }>();
+        for (const histBucket of buckets) {
+          const time = bucketKeyToMs(histBucket.key);
+          const innerBuckets = histBucket[secondBucketKey]?.buckets || [];
+          for (const termBucket of innerBuckets) {
+            const groupKey = String(termBucket.key);
+            if (!seriesMap.has(groupKey)) {
+              seriesMap.set(groupKey, { times: [], values: new Map() });
+            }
+            const series = seriesMap.get(groupKey)!;
+            series.times.push(time);
+            for (const m of metrics) {
+              if (m.hide) continue;
+              const mKey = m.type === 'count' ? '_count' : `metric_${m.id}`;
+              if (!series.values.has(mKey)) series.values.set(mKey, []);
+              const val = m.type === 'count' ? termBucket.doc_count : (termBucket[`metric_${m.id}`]?.value ?? 0);
+              series.values.get(mKey)!.push(val);
+            }
+          }
+        }
+        const frames: MutableDataFrame[] = [];
+        for (const [groupKey, series] of seriesMap) {
+          for (const m of metrics) {
+            if (m.hide) continue;
+            const mKey = m.type === 'count' ? '_count' : `metric_${m.id}`;
+            const mLabel = m.type === 'count' ? 'Count' : `${m.type}(${m.field})`;
+            frames.push(new MutableDataFrame({
+              refId: query.refId,
+              fields: [
+                { name: 'Time', type: FieldType.time, values: [...series.times] },
+                { name: `${mLabel} [${groupKey}]`, type: FieldType.number, values: series.values.get(mKey) || [],
+                  config: { displayNameFromDS: `${mLabel}: ${groupKey}` } },
+              ],
+            }));
+          }
+        }
+        return frames.length > 0 ? frames : [this.buildErrorFrame(query.refId, 'No data for grouped time series.')];
+      }
+    }
+
+    // Fallback: treat as simple time series
     return this.buildNewTimeSeriesFrames(buckets, metrics, query, null);
   }
 
@@ -1244,6 +1299,65 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
           values: buckets.map((b: any) => b[metricKey]?.value ?? 0),
         });
       }
+    }
+
+    return [new MutableDataFrame({
+      refId: query.refId,
+      meta: { preferredVisualisationType: 'table' },
+      fields,
+    })];
+  }
+
+  /**
+   * Build a flattened table from nested terms → terms → metrics.
+   * Each row = outer_key + inner_key + metric values.
+   */
+  private buildNestedTermsTable(
+    outerBuckets: any[],
+    outerBucket: import('./types').BucketAggregation,
+    innerBucket: import('./types').BucketAggregation,
+    innerBucketKey: string,
+    metrics: import('./types').MetricAggregation[],
+    query: QuickwitQuery
+  ): MutableDataFrame[] {
+    const outerKeys: string[] = [];
+    const innerKeys: string[] = [];
+    const metricValues: Map<string, number[]> = new Map();
+
+    for (const ob of outerBuckets) {
+      const outerKey = String(ob.key);
+      const innerBuckets = ob[innerBucketKey]?.buckets || [];
+      for (const ib of innerBuckets) {
+        outerKeys.push(outerKey);
+        innerKeys.push(String(ib.key));
+        for (const m of metrics) {
+          if (m.hide) continue;
+          const mKey = m.type === 'count' ? '_count' : `metric_${m.id}`;
+          if (!metricValues.has(mKey)) metricValues.set(mKey, []);
+          const val = m.type === 'count' ? ib.doc_count : (ib[`metric_${m.id}`]?.value ?? 0);
+          metricValues.get(mKey)!.push(val);
+        }
+      }
+    }
+
+    if (outerKeys.length === 0) {
+      return [this.buildErrorFrame(query.refId, 'No data for nested terms aggregation.')];
+    }
+
+    const fields: any[] = [
+      { name: outerBucket.field || 'Group 1', type: FieldType.string, values: outerKeys },
+      { name: innerBucket.field || 'Group 2', type: FieldType.string, values: innerKeys },
+    ];
+
+    for (const m of metrics) {
+      if (m.hide) continue;
+      const mKey = m.type === 'count' ? '_count' : `metric_${m.id}`;
+      const mLabel = m.type === 'count' ? 'Count' : `${m.type}(${m.field})`;
+      fields.push({
+        name: mLabel,
+        type: FieldType.number,
+        values: metricValues.get(mKey) || [],
+      });
     }
 
     return [new MutableDataFrame({
