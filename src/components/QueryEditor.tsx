@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react';
 import { QueryEditorProps, SelectableValue } from '@grafana/data';
 import {
   InlineField,
@@ -178,13 +178,26 @@ function QueryInput({ value, placeholder, fields, onChange, onRunQuery, rows }: 
     if (e.key === 'Enter' && (e.shiftKey || e.ctrlKey)) { e.preventDefault(); setShowSuggestions(false); onRunQuery(); }
   };
 
+  // Track desired cursor position for restoration after re-render
+  const cursorRestoreRef = useRef<number | null>(null);
+
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newVal = e.target.value;
     const pos = e.target.selectionStart || 0;
+    cursorRestoreRef.current = pos;
     onChange(newVal);
     setCursorPos(pos);
     updateSuggestions(newVal, pos);
   };
+
+  // Restore cursor position after React re-renders the controlled textarea
+  useLayoutEffect(() => {
+    if (cursorRestoreRef.current !== null && inputRef.current) {
+      inputRef.current.selectionStart = cursorRestoreRef.current;
+      inputRef.current.selectionEnd = cursorRestoreRef.current;
+      cursorRestoreRef.current = null;
+    }
+  });
 
   const handleBlur = () => {
     setTimeout(() => setShowSuggestions(false), 200);
