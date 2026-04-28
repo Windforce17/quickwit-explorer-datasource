@@ -111,11 +111,20 @@ interface QueryInputProps {
 
 function QueryInput({ value, placeholder, fields, onChange, onRunQuery, rows }: QueryInputProps) {
   const theme = useTheme2();
+  const [localValue, setLocalValue] = useState(value);
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [cursorPos, setCursorPos] = useState(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const isFocusedRef = useRef(false);
+
+  // Sync external value changes only when not focused (e.g. query loaded from URL)
+  useEffect(() => {
+    if (!isFocusedRef.current) {
+      setLocalValue(value);
+    }
+  }, [value]);
 
   const allCompletions = useMemo(() => {
     const fieldWithColon = fields.map((f) => `${f}:`);
@@ -152,8 +161,9 @@ function QueryInput({ value, placeholder, fields, onChange, onRunQuery, rows }: 
 
   const applySuggestion = useCallback(
     (suggestion: string) => {
-      const { start, end } = getCurrentToken(value, cursorPos);
-      const newValue = value.substring(0, start) + suggestion + value.substring(end);
+      const { start, end } = getCurrentToken(localValue, cursorPos);
+      const newValue = localValue.substring(0, start) + suggestion + localValue.substring(end);
+      setLocalValue(newValue);
       onChange(newValue);
       setShowSuggestions(false);
       const newPos = start + suggestion.length;
@@ -163,7 +173,7 @@ function QueryInput({ value, placeholder, fields, onChange, onRunQuery, rows }: 
           inputRef.current.selectionEnd = newPos;
         }
       }, 0);
-    }, [value, cursorPos, getCurrentToken, onChange]
+    }, [localValue, cursorPos, getCurrentToken, onChange]
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -175,32 +185,30 @@ function QueryInput({ value, placeholder, fields, onChange, onRunQuery, rows }: 
       }
       if (e.key === 'Escape') { e.preventDefault(); setShowSuggestions(false); return; }
     }
-    if (e.key === 'Enter' && (e.shiftKey || e.ctrlKey)) { e.preventDefault(); setShowSuggestions(false); onRunQuery(); }
+    if (e.key === 'Enter' && (e.shiftKey || e.ctrlKey)) {
+      e.preventDefault();
+      setShowSuggestions(false);
+      onChange(localValue);
+      onRunQuery();
+    }
   };
-
-  // Track desired cursor position for restoration after re-render
-  const cursorRestoreRef = useRef<number | null>(null);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newVal = e.target.value;
     const pos = e.target.selectionStart || 0;
-    cursorRestoreRef.current = pos;
-    onChange(newVal);
+    setLocalValue(newVal);
     setCursorPos(pos);
     updateSuggestions(newVal, pos);
   };
 
-  // Restore cursor position after React re-renders the controlled textarea
-  useLayoutEffect(() => {
-    if (cursorRestoreRef.current !== null && inputRef.current) {
-      inputRef.current.selectionStart = cursorRestoreRef.current;
-      inputRef.current.selectionEnd = cursorRestoreRef.current;
-      cursorRestoreRef.current = null;
-    }
-  });
+  const handleFocus = () => {
+    isFocusedRef.current = true;
+  };
 
   const handleBlur = () => {
+    isFocusedRef.current = false;
     setTimeout(() => setShowSuggestions(false), 200);
+    onChange(localValue);
     onRunQuery();
   };
 
@@ -208,10 +216,11 @@ function QueryInput({ value, placeholder, fields, onChange, onRunQuery, rows }: 
     <div style={{ position: 'relative', width: '100%' }}>
       <textarea
         ref={inputRef}
-        value={value}
+        value={localValue}
         placeholder={placeholder}
         onChange={handleChange}
         onKeyDown={handleKeyDown}
+        onFocus={handleFocus}
         onBlur={handleBlur}
         onClick={(e) => setCursorPos((e.target as HTMLTextAreaElement).selectionStart || 0)}
         rows={rows || 2}
