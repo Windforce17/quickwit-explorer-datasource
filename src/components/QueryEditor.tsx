@@ -193,13 +193,25 @@ function QueryInput({ value, placeholder, fields, onChange, onRunQuery, rows }: 
     }
   };
 
+  // Use a ref to hold the latest value so we can sync to parent without causing re-render
+  const latestValueRef = useRef(value);
+
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newVal = e.target.value;
     const pos = e.target.selectionStart || 0;
     setLocalValue(newVal);
+    latestValueRef.current = newVal;
     setCursorPos(pos);
     updateSuggestions(newVal, pos);
+    // Debounced sync to parent: update parent state so Run Query button always has latest value
+    // Use requestAnimationFrame to batch with React's own updates and avoid cursor jump
+    if (syncTimerRef.current) { clearTimeout(syncTimerRef.current); }
+    syncTimerRef.current = window.setTimeout(() => {
+      onChange(latestValueRef.current);
+    }, 300);
   };
+
+  const syncTimerRef = useRef<number | null>(null);
 
   const handleFocus = () => {
     isFocusedRef.current = true;
@@ -207,6 +219,8 @@ function QueryInput({ value, placeholder, fields, onChange, onRunQuery, rows }: 
 
   const handleBlur = () => {
     isFocusedRef.current = false;
+    // Cancel any pending debounced sync
+    if (syncTimerRef.current) { clearTimeout(syncTimerRef.current); syncTimerRef.current = null; }
     setTimeout(() => setShowSuggestions(false), 200);
     onChange(localValue);
     onRunQuery();
