@@ -754,7 +754,20 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       params.set('operation', query.operationName);
     }
     if (query.query && query.query !== '*') {
-      params.set('tags', getTemplateSrv().replace(query.query, options.scopedVars));
+      const rawTags = getTemplateSrv().replace(query.query, options.scopedVars);
+      // Convert key=value pairs to JSON object for Quickwit Jaeger API
+      // Supports: key=value key2=value2 OR key=value,key2=value2
+      const tagObj: Record<string, string> = {};
+      const pairs = rawTags.split(/[\s,]+/).filter(Boolean);
+      for (const pair of pairs) {
+        const eqIdx = pair.indexOf('=');
+        if (eqIdx > 0) {
+          tagObj[pair.substring(0, eqIdx)] = pair.substring(eqIdx + 1);
+        }
+      }
+      if (Object.keys(tagObj).length > 0) {
+        params.set('tags', JSON.stringify(tagObj));
+      }
     }
     if (query.minDuration) params.set('minDuration', query.minDuration);
     if (query.maxDuration) params.set('maxDuration', query.maxDuration);

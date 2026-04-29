@@ -867,7 +867,7 @@ export function QueryEditor(props: Props) {
             <InlineField label="Operation" labelWidth={10}>
               <Select width={25} options={operations} value={q.operationName || ''}
                 onChange={(v) => updateAndRun({ operationName: v.value || '' })}
-                placeholder="Select operation..." isClearable disabled={!q.serviceName} />
+                placeholder="Select operation..." isClearable allowCustomValue disabled={!q.serviceName} />
             </InlineField>
           </InlineFieldRow>
           <InlineFieldRow>
