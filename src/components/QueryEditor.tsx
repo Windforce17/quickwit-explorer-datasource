@@ -485,7 +485,7 @@ function BucketRow({ bucket, index, fieldOptions, metrics, onUpdate, onRemove, c
             width={16}
             options={bucketTypeOptions}
             value={bucket.type}
-            onChange={(v) => onUpdate({ ...bucket, type: v.value || 'date_histogram', settings: {} })}
+            onChange={(v) => onUpdate({ ...bucket, type: v.value || 'date_histogram', field: '', settings: {} })}
           />
         </InlineField>
         {bucket.type === 'terms' && (
