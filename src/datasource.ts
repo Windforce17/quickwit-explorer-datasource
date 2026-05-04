@@ -23,8 +23,8 @@ import {
   defaultQuery,
 } from './types';
 
-/** Default timeout for trace lookups (ms) */
-const TRACE_TIMEOUT_MS = 8000;
+/** Default timeout for all requests (ms) – 3 minutes */
+const REQUEST_TIMEOUT_MS = 180000;
 
 /** Safely extract error message from any error object */
 function extractErrorMessage(e: any): string {
@@ -722,7 +722,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     try {
       const resp = await this.getWithTimeout<JaegerApiResponse<JaegerTrace[]>>(
         `/api/v1/${index}/jaeger/api/traces/${traceId}`,
-        TRACE_TIMEOUT_MS
+        REQUEST_TIMEOUT_MS
       );
       if (!resp?.data?.length) {
         return [this.buildErrorFrame(query.refId, `Trace ${traceId} not found.`)];
@@ -781,7 +781,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     try {
       const resp = await this.getWithTimeout<JaegerApiResponse<JaegerTrace[]>>(
         `/api/v1/${index}/jaeger/api/traces?${params.toString()}`,
-        TRACE_TIMEOUT_MS * 2
+        REQUEST_TIMEOUT_MS
       );
       if (!resp?.data?.length) {
         return [this.buildErrorFrame(query.refId, 'No traces found.')];
@@ -929,7 +929,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     if (!idx) return [];
     try {
       const resp = await this.getWithTimeout<JaegerApiResponse<string[]>>(
-        `/api/v1/${idx}/jaeger/api/services`, TRACE_TIMEOUT_MS);
+        `/api/v1/${idx}/jaeger/api/services`, REQUEST_TIMEOUT_MS);
       return resp?.data || [];
     } catch (e: any) {
       console.error('getServices failed:', extractErrorMessage(e));
@@ -942,7 +942,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     if (!idx || !service) return [];
     try {
       const resp = await this.getWithTimeout<JaegerApiResponse<string[]>>(
-        `/api/v1/${idx}/jaeger/api/services/${encodeURIComponent(service)}/operations`, TRACE_TIMEOUT_MS);
+        `/api/v1/${idx}/jaeger/api/services/${encodeURIComponent(service)}/operations`, REQUEST_TIMEOUT_MS);
       return resp?.data || [];
     } catch (e: any) {
       console.error('getOperations failed:', extractErrorMessage(e));
@@ -1703,11 +1703,19 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   }
 
   private async get<T>(path: string): Promise<T> {
-    const resp = await getBackendSrv().datasourceRequest({
-      url: `${this.baseUrl}${path}`,
-      method: 'GET',
-    });
-    return resp.data;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const resp = await getBackendSrv().datasourceRequest({
+        url: `${this.baseUrl}${path}`,
+        method: 'GET',
+        // @ts-ignore - signal is supported but not in the type definition
+        signal: controller.signal,
+      });
+      return resp.data;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async getWithTimeout<T>(path: string, timeoutMs: number): Promise<T> {
@@ -1732,11 +1740,19 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
   }
 
   private async post<T>(path: string, body: any): Promise<T> {
-    const resp = await getBackendSrv().datasourceRequest({
-      url: `${this.baseUrl}${path}`,
-      method: 'POST',
-      data: body,
-    });
-    return resp.data;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const resp = await getBackendSrv().datasourceRequest({
+        url: `${this.baseUrl}${path}`,
+        method: 'POST',
+        data: body,
+        // @ts-ignore - signal is supported but not in the type definition
+        signal: controller.signal,
+      });
+      return resp.data;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
