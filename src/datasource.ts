@@ -16,8 +16,6 @@ import {
   QwIndex,
   QwSearchResponse,
   QwFieldMapping,
-  JaegerTrace,
-  JaegerApiResponse,
   QueryType,
   MetricAggType,
   defaultQuery,
@@ -720,14 +718,18 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     if (!traceId) return [];
 
     try {
-      const resp = await this.getWithTimeout<JaegerApiResponse<JaegerTrace[]>>(
-        `/api/v1/${index}/jaeger/api/traces/${traceId}`,
-        REQUEST_TIMEOUT_MS
+      const resp = await this.post<QwSearchResponse>(
+        `/api/v1/${index}/search`,
+        {
+          query: `trace_id:${traceId}`,
+          max_hits: 1000,
+          sort_by_field: '+span_start_timestamp_nanos',
+        }
       );
-      if (!resp?.data?.length) {
+      if (!resp?.hits?.length) {
         return [this.buildErrorFrame(query.refId, `Trace ${traceId} not found.`)];
       }
-      return [this.jaegerTraceToFrame(resp.data[0], query.refId)];
+      return [this.otelSpansToTraceFrame(resp.hits, query.refId)];
     } catch (e: any) {
       const msg = extractErrorMessage(e);
       if (msg.includes('timeout') || msg.includes('aborted') || msg.includes('Abort')) {
@@ -746,53 +748,120 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       return [this.buildErrorFrame(query.refId, 'No trace index configured.')];
     }
 
-    const params = new URLSearchParams();
+    const limit = query.traceLimit || 20;
+
+    // Build Lucene query from trace search parameters
+    const queryParts: string[] = [];
     if (query.serviceName) {
-      params.set('service', getTemplateSrv().replace(query.serviceName, options.scopedVars));
+      const svc = getTemplateSrv().replace(query.serviceName, options.scopedVars);
+      queryParts.push(`service_name:${svc}`);
     }
     if (query.operationName && query.operationName !== 'All') {
-      params.set('operation', query.operationName);
+      queryParts.push(`span_name:${query.operationName}`);
     }
     if (query.query && query.query !== '*') {
       const rawTags = getTemplateSrv().replace(query.query, options.scopedVars);
-      // Convert key=value pairs to JSON object for Quickwit Jaeger API
-      // Supports: key=value key2=value2 OR key=value,key2=value2
-      const tagObj: Record<string, string> = {};
+      // Support key=value pairs → convert to span_attributes.key:value
       const pairs = rawTags.split(/[\s,]+/).filter(Boolean);
       for (const pair of pairs) {
         const eqIdx = pair.indexOf('=');
         if (eqIdx > 0) {
-          tagObj[pair.substring(0, eqIdx)] = pair.substring(eqIdx + 1);
+          const k = pair.substring(0, eqIdx);
+          const v = pair.substring(eqIdx + 1);
+          queryParts.push(`span_attributes.${k}:${v}`);
+        } else {
+          // Pass through as raw Lucene clause
+          queryParts.push(pair);
         }
       }
-      if (Object.keys(tagObj).length > 0) {
-        params.set('tags', JSON.stringify(tagObj));
-      }
     }
-    if (query.minDuration) params.set('minDuration', query.minDuration);
-    if (query.maxDuration) params.set('maxDuration', query.maxDuration);
+    if (query.minDuration) {
+      const minMs = this.parseDurationToMs(query.minDuration);
+      if (minMs > 0) queryParts.push(`span_duration_millis:[${minMs} TO *]`);
+    }
+    if (query.maxDuration) {
+      const maxMs = this.parseDurationToMs(query.maxDuration);
+      if (maxMs > 0) queryParts.push(`span_duration_millis:[* TO ${maxMs}]`);
+    }
 
-    const from = options.range.from.valueOf() * 1000;
-    const to = options.range.to.valueOf() * 1000;
-    params.set('start', from.toString());
-    params.set('end', to.toString());
-    params.set('limit', String(query.traceLimit || 20));
+    const luceneQuery = queryParts.length > 0 ? queryParts.join(' AND ') : '*';
+
+    // Time range in seconds for native API
+    const fromSec = Math.floor(options.range.from.valueOf() / 1000);
+    const toSec = Math.ceil(options.range.to.valueOf() / 1000);
 
     try {
-      const resp = await this.getWithTimeout<JaegerApiResponse<JaegerTrace[]>>(
-        `/api/v1/${index}/jaeger/api/traces?${params.toString()}`,
-        REQUEST_TIMEOUT_MS
+      // Fetch spans matching criteria, sorted by newest first
+      // Overfetch to ensure we get enough unique traces after dedup
+      const fetchSize = limit * 20;
+      const resp = await this.post<QwSearchResponse>(
+        `/api/v1/${index}/search`,
+        {
+          query: luceneQuery,
+          max_hits: fetchSize,
+          sort_by_field: '-span_start_timestamp_nanos',
+          start_timestamp: fromSec,
+          end_timestamp: toSec,
+        }
       );
-      if (!resp?.data?.length) {
+
+      if (!resp?.hits?.length) {
         return [this.buildErrorFrame(query.refId, 'No traces found.')];
       }
-      return [this.buildTraceSearchTable(resp.data, query.refId)];
+
+      // Deduplicate by trace_id, keep newest span per trace
+      const seenTraces = new Map<string, any>();
+      for (const span of resp.hits) {
+        const tid = span.trace_id;
+        if (!seenTraces.has(tid)) {
+          seenTraces.set(tid, span);
+        }
+      }
+
+      // Take top `limit` unique traces
+      const uniqueTraceIds = Array.from(seenTraces.keys()).slice(0, limit);
+
+      // For each trace, fetch all spans to build summary
+      const traceSummaries = await Promise.all(
+        uniqueTraceIds.map(async (tid) => {
+          const traceResp = await this.post<QwSearchResponse>(
+            `/api/v1/${index}/search`,
+            {
+              query: `trace_id:${tid}`,
+              max_hits: 1000,
+              sort_by_field: '+span_start_timestamp_nanos',
+            }
+          );
+          return { traceId: tid, spans: traceResp?.hits || [] };
+        })
+      );
+
+      return [this.buildNativeTraceSearchTable(traceSummaries, query.refId)];
     } catch (e: any) {
       return [this.buildErrorFrame(query.refId, `Trace search failed: ${extractErrorMessage(e)}`)];
     }
   }
 
-  private jaegerTraceToFrame(trace: JaegerTrace, refId: string): MutableDataFrame {
+  /** Parse duration string (e.g. "100ms", "1.5s", "2m") to milliseconds */
+  private parseDurationToMs(duration: string): number {
+    const match = duration.match(/^([\d.]+)\s*(ms|s|m|h)?$/i);
+    if (!match) return 0;
+    const val = parseFloat(match[1]);
+    const unit = (match[2] || 'ms').toLowerCase();
+    switch (unit) {
+      case 'ms': return val;
+      case 's': return val * 1000;
+      case 'm': return val * 60000;
+      case 'h': return val * 3600000;
+      default: return val;
+    }
+  }
+
+  /**
+   * Convert OTEL spans (from native search API) to Grafana trace panel DataFrame.
+   * Uses the same field schema as Jaeger format so Grafana's trace panel can render it.
+   */
+  private otelSpansToTraceFrame(spans: any[], refId: string): MutableDataFrame {
     const frame = new MutableDataFrame({
       refId,
       meta: {
@@ -814,25 +883,66 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       ],
     });
 
-    for (const span of trace.spans) {
-      const process = trace.processes[span.processID] || { serviceName: 'unknown', tags: [] };
-      const parentRef = span.references?.find((r) => r.refType === 'CHILD_OF');
+    for (const span of spans) {
+      // Convert span_attributes JSON to Jaeger-style KV tags
+      const tags: Array<{ key: string; type: string; value: any }> = [];
+      if (span.span_attributes && typeof span.span_attributes === 'object') {
+        for (const [k, v] of Object.entries(span.span_attributes)) {
+          tags.push({ key: k, type: typeof v === 'number' ? 'int64' : 'string', value: v });
+        }
+      }
+      // Add span_kind as a tag
+      if (span.span_kind !== undefined) {
+        const kindNames: Record<number, string> = { 0: 'unspecified', 1: 'internal', 2: 'server', 3: 'client', 4: 'producer', 5: 'consumer' };
+        tags.push({ key: 'span.kind', type: 'string', value: kindNames[span.span_kind] || String(span.span_kind) });
+      }
+      // Add span_status as a tag
+      if (span.span_status?.code) {
+        tags.push({ key: 'otel.status_code', type: 'string', value: span.span_status.code });
+      }
+
+      // Convert resource_attributes to service tags
+      const serviceTags: Array<{ key: string; type: string; value: any }> = [];
+      if (span.resource_attributes && typeof span.resource_attributes === 'object') {
+        for (const [k, v] of Object.entries(span.resource_attributes)) {
+          serviceTags.push({ key: k, type: typeof v === 'number' ? 'int64' : 'string', value: v });
+        }
+      }
+
+      // Convert events to logs
+      const logs: Array<{ timestamp: number; fields: Array<{ key: string; type: string; value: any }> }> = [];
+      if (Array.isArray(span.events)) {
+        for (const evt of span.events) {
+          const fields: Array<{ key: string; type: string; value: any }> = [];
+          if (evt.event_name) fields.push({ key: 'event', type: 'string', value: evt.event_name });
+          if (evt.event_attributes && typeof evt.event_attributes === 'object') {
+            for (const [k, v] of Object.entries(evt.event_attributes)) {
+              fields.push({ key: k, type: 'string', value: String(v) });
+            }
+          }
+          // event_timestamp_nanos → microseconds for Grafana
+          const tsUs = evt.event_timestamp_nanos ? Math.floor(evt.event_timestamp_nanos / 1000) : 0;
+          logs.push({ timestamp: tsUs, fields });
+        }
+      }
+
+      // span_start_timestamp_nanos → microseconds (Grafana trace panel uses µs)
+      const startTimeUs = Math.floor(span.span_start_timestamp_nanos / 1000);
+      // duration in microseconds
+      const durationUs = span.span_duration_millis * 1000;
 
       frame.add({
-        traceID: span.traceID,
-        spanID: span.spanID,
-        parentSpanID: parentRef?.spanID || '',
-        operationName: span.operationName,
-        serviceName: process.serviceName,
-        serviceTags: process.tags || [],
-        startTime: span.startTime / 1000,
-        duration: span.duration / 1000,
-        logs: (span.logs || []).map((l) => ({
-          timestamp: l.timestamp / 1000,
-          fields: l.fields,
-        })),
-        tags: span.tags || [],
-        warnings: span.warnings || [],
+        traceID: span.trace_id,
+        spanID: span.span_id,
+        parentSpanID: span.parent_span_id || '',
+        operationName: span.span_name,
+        serviceName: span.service_name,
+        serviceTags,
+        startTime: startTimeUs,
+        duration: durationUs,
+        logs,
+        tags,
+        warnings: [],
       });
     }
 
@@ -864,7 +974,10 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     return frame;
   }
 
-  private buildTraceSearchTable(traces: JaegerTrace[], refId: string): MutableDataFrame {
+  private buildNativeTraceSearchTable(
+    traceSummaries: Array<{ traceId: string; spans: any[] }>,
+    refId: string
+  ): MutableDataFrame {
     const frame = new MutableDataFrame({
       refId,
       meta: { preferredVisualisationType: 'table' },
@@ -878,19 +991,24 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       ],
     });
 
-    for (const trace of traces) {
-      if (!trace.spans?.length) continue;
-      const rootSpan = trace.spans.reduce((a, b) => (a.startTime < b.startTime ? a : b));
-      const process = trace.processes[rootSpan.processID];
-      const maxEnd = trace.spans.reduce((max, s) => Math.max(max, s.startTime + s.duration), 0);
+    for (const { traceId, spans } of traceSummaries) {
+      if (!spans.length) continue;
+
+      // Find root span (no parent_span_id) or earliest span
+      let rootSpan = spans.find((s) => !s.parent_span_id) || spans[0];
+
+      // Calculate total trace duration
+      const minStart = Math.min(...spans.map((s) => s.span_start_timestamp_nanos));
+      const maxEnd = Math.max(...spans.map((s) => s.span_end_timestamp_nanos));
+      const durationMs = Math.round((maxEnd - minStart) / 1_000_000);
 
       frame.add({
-        'Trace ID': trace.traceID,
-        'Trace Name': rootSpan.operationName,
-        Service: process?.serviceName || 'unknown',
-        'Start Time': Math.floor(rootSpan.startTime / 1000),
-        'Duration (ms)': Math.round((maxEnd - rootSpan.startTime) / 1000),
-        Spans: trace.spans.length,
+        'Trace ID': traceId,
+        'Trace Name': rootSpan.span_name,
+        Service: rootSpan.service_name,
+        'Start Time': Math.floor(rootSpan.span_start_timestamp_nanos / 1_000_000), // ns → ms
+        'Duration (ms)': durationMs,
+        Spans: spans.length,
       });
     }
 
@@ -928,9 +1046,16 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     const idx = index || this.traceIndex;
     if (!idx) return [];
     try {
-      const resp = await this.getWithTimeout<JaegerApiResponse<string[]>>(
-        `/api/v1/${idx}/jaeger/api/services`, REQUEST_TIMEOUT_MS);
-      return resp?.data || [];
+      const resp = await this.post<QwSearchResponse>(
+        `/api/v1/${idx}/search`,
+        {
+          query: '*',
+          max_hits: 0,
+          aggs: { services: { terms: { field: 'service_name', size: 500 } } },
+        }
+      );
+      const buckets = (resp as any)?.aggregations?.services?.buckets || [];
+      return buckets.map((b: any) => b.key);
     } catch (e: any) {
       console.error('getServices failed:', extractErrorMessage(e));
       return [];
@@ -941,9 +1066,16 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     const idx = index || this.traceIndex;
     if (!idx || !service) return [];
     try {
-      const resp = await this.getWithTimeout<JaegerApiResponse<string[]>>(
-        `/api/v1/${idx}/jaeger/api/services/${encodeURIComponent(service)}/operations`, REQUEST_TIMEOUT_MS);
-      return resp?.data || [];
+      const resp = await this.post<QwSearchResponse>(
+        `/api/v1/${idx}/search`,
+        {
+          query: `service_name:${service}`,
+          max_hits: 0,
+          aggs: { operations: { terms: { field: 'span_name', size: 500 } } },
+        }
+      );
+      const buckets = (resp as any)?.aggregations?.operations?.buckets || [];
+      return buckets.map((b: any) => b.key);
     } catch (e: any) {
       console.error('getOperations failed:', extractErrorMessage(e));
       return [];
