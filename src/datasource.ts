@@ -722,7 +722,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         `/api/v1/${index}/search`,
         {
           query: `trace_id:${traceId}`,
-          max_hits: 1000,
+          max_hits: 10000,
           sort_by_field: '+span_start_timestamp_nanos',
         }
       );
@@ -828,7 +828,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
             `/api/v1/${index}/search`,
             {
               query: `trace_id:${tid}`,
-              max_hits: 1000,
+              max_hits: 10000,
               sort_by_field: '+span_start_timestamp_nanos',
             }
           );
