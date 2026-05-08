@@ -914,16 +914,18 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
               fields.push({ key: k, type: 'string', value: String(v) });
             }
           }
-          // event_timestamp_nanos → microseconds for Grafana
-          const tsUs = evt.event_timestamp_nanos ? Math.floor(evt.event_timestamp_nanos / 1000) : 0;
-          logs.push({ timestamp: tsUs, fields });
+          // event_timestamp_nanos → milliseconds (Grafana trace panel uses ms internally for jaeger format)
+          const tsMs = evt.event_timestamp_nanos ? Math.floor(evt.event_timestamp_nanos / 1_000_000) : 0;
+          logs.push({ timestamp: tsMs, fields });
         }
       }
 
-      // span_start_timestamp_nanos → microseconds (Grafana trace panel uses µs)
-      const startTimeUs = Math.floor(span.span_start_timestamp_nanos / 1000);
-      // duration in microseconds
-      const durationUs = span.span_duration_millis * 1000;
+      // span_start_timestamp_nanos → milliseconds (Grafana trace panel uses ms internally for jaeger format)
+      const startTimeMs = Math.floor(span.span_start_timestamp_nanos / 1_000_000);
+      // duration in milliseconds: prefer computing from timestamps for better precision
+      const durationMs = span.span_end_timestamp_nanos
+        ? Math.floor((span.span_end_timestamp_nanos - span.span_start_timestamp_nanos) / 1_000_000)
+        : (span.span_duration_millis || 0);
 
       frame.add({
         traceID: span.trace_id,
@@ -932,8 +934,8 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         operationName: span.span_name,
         serviceName: span.service_name,
         serviceTags,
-        startTime: startTimeUs,
-        duration: durationUs,
+        startTime: startTimeMs,
+        duration: durationMs,
         logs,
         tags,
         warnings: [],
