@@ -117,6 +117,9 @@ export interface QuickwitQuery extends DataQuery {
 
   // Internal: used by supplementary query
   _isLogsVolume?: boolean;
+
+  /** Fast mode: skip logs volume histogram aggregation for faster queries (default: true) */
+  fastMode?: boolean;
 }
 
 export const defaultQuery: Partial<QuickwitQuery> = {
@@ -127,6 +130,7 @@ export const defaultQuery: Partial<QuickwitQuery> = {
   sortOrder: 'desc',
   traceLimit: 20,
   metricType: MetricAggType.Count,
+  fastMode: true,
 };
 
 // Default metrics configuration for new Metrics queries

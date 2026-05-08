@@ -223,6 +223,10 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     if (options.type !== SupplementaryQueryType.LogsVolume) return undefined;
     if (originalQuery.queryType && originalQuery.queryType !== QueryType.Logs) return undefined;
 
+    // Fast mode: skip logs volume histogram for faster queries
+    const fastMode = originalQuery.fastMode !== undefined ? originalQuery.fastMode : true;
+    if (fastMode) return undefined;
+
     return {
       ...originalQuery,
       refId: `log-volume-${originalQuery.refId}`,

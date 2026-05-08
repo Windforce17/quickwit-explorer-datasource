@@ -10,6 +10,7 @@ import {
   IconButton,
   useTheme2,
   Collapse,
+  InlineSwitch,
 } from '@grafana/ui';
 import { QuickwitExplorerDatasource } from '../datasource';
 import {
@@ -824,6 +825,14 @@ export function QueryEditor(props: Props) {
                 options={sizeOptions}
                 value={q.size || 100}
                 onChange={(v) => updateAndRun({ size: v.value || 100 })}
+              />
+            </InlineField>
+            <InlineField label="Fast Mode" labelWidth={10} tooltip="Skip histogram aggregation for faster queries">
+              <InlineSwitch
+                value={q.fastMode !== undefined ? q.fastMode : true}
+                onChange={(e: React.FormEvent<HTMLInputElement>) => {
+                  updateAndRun({ fastMode: (e.target as HTMLInputElement).checked });
+                }}
               />
             </InlineField>
           </InlineFieldRow>
