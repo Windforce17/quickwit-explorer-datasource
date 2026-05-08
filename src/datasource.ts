@@ -797,7 +797,7 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
     try {
       // Fetch spans matching criteria, sorted by newest first
       // Overfetch to ensure we get enough unique traces after dedup
-      const fetchSize = limit * 20;
+      const fetchSize = limit * 50;
       const resp = await this.post<QwSearchResponse>(
         `/api/v1/${index}/search`,
         {
@@ -813,32 +813,22 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         return [this.buildErrorFrame(query.refId, 'No traces found.')];
       }
 
-      // Deduplicate by trace_id, keep newest span per trace
-      const seenTraces = new Map<string, any>();
+      // Deduplicate by trace_id, collect all fetched spans per trace for summary
+      const traceSpansMap = new Map<string, any[]>();
       for (const span of resp.hits) {
         const tid = span.trace_id;
-        if (!seenTraces.has(tid)) {
-          seenTraces.set(tid, span);
+        if (!traceSpansMap.has(tid)) {
+          traceSpansMap.set(tid, []);
         }
+        traceSpansMap.get(tid)!.push(span);
       }
 
-      // Take top `limit` unique traces
-      const uniqueTraceIds = Array.from(seenTraces.keys()).slice(0, limit);
-
-      // For each trace, fetch all spans to build summary
-      const traceSummaries = await Promise.all(
-        uniqueTraceIds.map(async (tid) => {
-          const traceResp = await this.post<QwSearchResponse>(
-            `/api/v1/${index}/search`,
-            {
-              query: `trace_id:${tid}`,
-              max_hits: 10000,
-              sort_by_field: '+span_start_timestamp_nanos',
-            }
-          );
-          return { traceId: tid, spans: traceResp?.hits || [] };
-        })
-      );
+      // Take top `limit` unique traces (ordered by first appearance = newest)
+      const traceSummaries: Array<{ traceId: string; spans: any[] }> = [];
+      for (const [tid, spans] of traceSpansMap) {
+        if (traceSummaries.length >= limit) break;
+        traceSummaries.push({ traceId: tid, spans });
+      }
 
       return [this.buildNativeTraceSearchTable(traceSummaries, query.refId)];
     } catch (e: any) {
@@ -1001,10 +991,12 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
       // Find root span (no parent_span_id) or earliest span
       let rootSpan = spans.find((s) => !s.parent_span_id) || spans[0];
 
-      // Calculate total trace duration
-      const minStart = Math.min(...spans.map((s) => s.span_start_timestamp_nanos));
-      const maxEnd = Math.max(...spans.map((s) => s.span_end_timestamp_nanos));
-      const durationMs = Math.round((maxEnd - minStart) / 1_000_000);
+      // Calculate duration from available spans (may be partial)
+      const startTimes = spans.map((s) => Number(s.span_start_timestamp_nanos)).filter((n) => !isNaN(n));
+      const endTimes = spans.map((s) => Number(s.span_end_timestamp_nanos)).filter((n) => !isNaN(n));
+      const minStart = startTimes.length ? Math.min(...startTimes) : 0;
+      const maxEnd = endTimes.length ? Math.max(...endTimes) : minStart;
+      const durationMs = minStart > 0 ? Math.round((maxEnd - minStart) / 1_000_000) : 0;
 
       frame.add({
         'Trace ID': traceId,
