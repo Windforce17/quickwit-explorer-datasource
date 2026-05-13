@@ -727,7 +727,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         {
           query: `trace_id:${traceId}`,
           max_hits: 10000,
-          sort_by_field: '+span_start_timestamp_nanos',
         }
       );
       if (!resp?.hits?.length) {
@@ -803,7 +802,6 @@ export class QuickwitExplorerDatasource extends DataSourceApi<QuickwitQuery, Qui
         {
           query: luceneQuery,
           max_hits: fetchSize,
-          sort_by_field: '-span_start_timestamp_nanos',
           start_timestamp: fromSec,
           end_timestamp: toSec,
         }
